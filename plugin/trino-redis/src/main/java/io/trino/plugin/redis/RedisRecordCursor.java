@@ -76,6 +76,7 @@ public class RedisRecordCursor
     private final char keyDelimiter;
     private final boolean isKeyPrefixSchemaTable;
     private final int scanCount;
+    private final boolean clusterEnabled;
 
     private ScanResult<String> redisCursor;
     private List<String> keys;
@@ -106,6 +107,7 @@ public class RedisRecordCursor
         this.keyDelimiter = clientManager.getRedisKeyDelimiter();
         this.isKeyPrefixSchemaTable = clientManager.isKeyPrefixSchemaTable();
         this.scanCount = clientManager.getRedisScanCount();
+        this.clusterEnabled = clientManager.isClusterEnabled();
         this.scanParams = setScanParams();
         this.maxKeysPerFetch = clientManager.getRedisMaxKeysPerFetch();
         this.currentRowGroup = new LinkedList<>();
@@ -209,6 +211,10 @@ public class RedisRecordCursor
             String keyString = currentKeys.get(i);
             Object object = hashValues.get(i);
             if (object instanceof JedisDataException jedisDataException) {
+                if (clusterEnabled && isRedirectionError(jedisDataException)) {
+                    log.warn(jedisDataException, "Skipping hash key %s due to cluster slot redirection", keyString);
+                    continue;
+                }
                 throw jedisDataException;
             }
             Map<String, String> hashValueMap = (Map<String, String>) object;
@@ -318,6 +324,12 @@ public class RedisRecordCursor
     @Override
     public void close() {}
 
+    private static boolean isRedirectionError(JedisDataException exception)
+    {
+        String message = exception.getMessage();
+        return message != null && (message.startsWith("MOVED") || message.startsWith("ASK"));
+    }
+
     private ScanParams setScanParams()
     {
         if (split.getKeyDataType() == RedisDataType.STRING) {
@@ -408,7 +420,42 @@ public class RedisRecordCursor
         hashValues = null;
 
         switch (split.getValueDataType()) {
-            case STRING -> stringValues = client.mget(currentKeys.toArray(new String[0]));
+            case STRING -> {
+                // In Redis Cluster, MGET fails with CROSSSLOT when keys hash to different slots.
+                // Scanned keys on a single master span many slots, so fetch each key individually
+                // via a pipeline of single-key GET commands. Standalone mode keeps the faster MGET.
+                if (clusterEnabled) {
+                    List<Object> replies;
+                    try (Pipeline pipeline = client.pipelined()) {
+                        for (String key : currentKeys) {
+                            pipeline.get(key);
+                        }
+                        replies = pipeline.syncAndReturnAll();
+                    }
+                    stringValues = new ArrayList<>(replies.size());
+                    for (int i = 0; i < replies.size(); i++) {
+                        Object reply = replies.get(i);
+                        if (reply instanceof JedisDataException jedisDataException) {
+                            // A slot may migrate to another node during a live resharding, in which case
+                            // GET on this master returns a MOVED/ASK error instead of a value. Skip the
+                            // key rather than failing the query; other data exceptions are surfaced.
+                            if (isRedirectionError(jedisDataException)) {
+                                log.warn(jedisDataException, "Skipping key %s due to cluster slot redirection", currentKeys.get(i));
+                                stringValues.add(null);
+                            }
+                            else {
+                                throw jedisDataException;
+                            }
+                        }
+                        else {
+                            stringValues.add((String) reply);
+                        }
+                    }
+                }
+                else {
+                    stringValues = client.mget(currentKeys.toArray(new String[0]));
+                }
+            }
             case HASH -> {
                 try (Pipeline pipeline = client.pipelined()) {
                     for (String key : currentKeys) {

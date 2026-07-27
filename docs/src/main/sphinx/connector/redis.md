@@ -18,7 +18,7 @@ string and hash types are supported.
 Requirements for using the connector in a catalog to connect to a Redis data
 source are:
 
-- Redis 5.0.14 or higher (Redis Cluster is not supported)
+- Redis 5.0.14 or higher (Redis Cluster is supported with `redis.cluster.enabled=true`)
 - Network access, by default on port 6379, from the Trino coordinator and
   workers to Redis.
 
@@ -59,6 +59,7 @@ The following configuration properties are available:
 | `redis.database-index`              | Redis database index                                                                              |
 | `redis.user`                        | Redis server username                                                                             |
 | `redis.password`                    | Redis server password                                                                             |
+| `redis.cluster.enabled`             | Whether Redis cluster mode is enabled (default: `false`)                                          |
 | `redis.tls.enabled`                 | Whether TLS security is enabled                                                                   |
 | `redis.tls.keystore-path`           | Path to the {doc}`JKS </security/inspect-jks>` or PKCS12 key store file                           |
 | `redis.tls.keystore-password`       | Password for the key store                                                                        |
@@ -91,7 +92,32 @@ The `hostname:port` pair for the Redis server.
 
 This property is required; there is no default.
 
-Redis Cluster is not supported.
+### `redis.cluster.enabled`
+
+Enables Redis Cluster mode. When set to `true`, Trino automatically discovers all healthy
+master nodes by issuing a `CLUSTER NODES` command to the seed node specified in `redis.nodes`.
+One Trino split is created per master node, allowing each Trino worker to independently scan
+one Redis shard. This ensures complete data coverage across all cluster shards.
+
+You can list one or more seed nodes in `redis.nodes`; each is tried in turn until one
+responds, so discovery does not depend on a single seed being available:
+
+```text
+redis.cluster.enabled=true
+redis.nodes=seed-1:6379,seed-2:6379
+```
+
+The following constraints apply when `redis.cluster.enabled=true`:
+
+- `redis.database-index` must be `0` (Redis Cluster only supports database 0)
+- `zset` key format is not supported (a ZSET key resides on a single node and cannot be split)
+- The Trino coordinator and all workers must be able to reach every master node at the
+  address it advertises through `CLUSTER NODES`. In deployments behind NAT, Docker, or
+  Kubernetes, configure the Redis nodes with `cluster-announce-ip` and
+  `cluster-announce-port` set to addresses reachable from Trino; otherwise split scanning
+  fails to connect to the discovered shards.
+
+This property is optional; the default is `false` (standalone mode).
 
 ### `redis.scan-count`
 

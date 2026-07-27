@@ -19,14 +19,22 @@ import io.airlift.log.Logger;
 import io.airlift.units.Duration;
 import io.trino.spi.HostAddress;
 import jakarta.annotation.PreDestroy;
+import redis.clients.jedis.CommandArguments;
+import redis.clients.jedis.Connection;
 import redis.clients.jedis.DefaultJedisClientConfig;
+import redis.clients.jedis.HostAndPort;
+import redis.clients.jedis.Protocol;
 import redis.clients.jedis.RedisClient;
+import redis.clients.jedis.util.SafeEncoder;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
@@ -48,6 +56,8 @@ public class RedisClientManager
     private final boolean keyPrefixSchemaTable;
     private final int redisScanCount;
     private final Set<RedisClientConfigurator> clientConfigurators;
+    private final Set<HostAddress> seedNodes;
+    private final boolean clusterEnabled;
 
     @Inject
     RedisClientManager(RedisConnectorConfig redisConnectorConfig, Set<RedisClientConfigurator> clientConfigurators)
@@ -62,6 +72,11 @@ public class RedisClientManager
         this.keyPrefixSchemaTable = redisConnectorConfig.isKeyPrefixSchemaTable();
         this.redisScanCount = redisConnectorConfig.getRedisScanCount();
         this.clientConfigurators = ImmutableSet.copyOf(clientConfigurators);
+        this.seedNodes = redisConnectorConfig.getNodes();
+        this.clusterEnabled = redisConnectorConfig.isClusterEnabled();
+        checkArgument(
+                !clusterEnabled || redisDataBaseIndex == 0,
+                "redis.database-index must be 0 when redis.cluster.enabled is true because Redis Cluster only supports database index 0");
     }
 
     @PreDestroy
@@ -97,33 +112,96 @@ public class RedisClientManager
         return redisScanCount;
     }
 
+    public boolean isClusterEnabled()
+    {
+        return clusterEnabled;
+    }
+
     public RedisClient getClient(HostAddress host)
     {
         requireNonNull(host, "host is null");
         return clientCache.computeIfAbsent(host, this::createClient);
     }
 
+    /**
+     * Discovers all master nodes in a Redis Cluster via the CLUSTER NODES command.
+     * Uses a low-level Connection to send the raw command, since clusterNodes() was
+     * removed from high-level Jedis 7.x clients.
+     * Each seed node from redis.nodes is tried in turn until one responds, so discovery
+     * does not depend on the availability of a single seed.
+     * Only applicable when redis.cluster.enabled=true.
+     */
+    public Set<HostAddress> getClusterMasterNodes()
+    {
+        DefaultJedisClientConfig clientConfig = baseClientConfigBuilder().build();
+        List<Exception> failures = new ArrayList<>();
+        for (HostAddress seed : seedNodes) {
+            try (Connection connection = new Connection(
+                    new HostAndPort(seed.getHostText(), seed.getPort()),
+                    clientConfig)) {
+                connection.sendCommand(new CommandArguments(Protocol.Command.CLUSTER).add("NODES"));
+                Set<HostAddress> masters = parseClusterMasterNodes(SafeEncoder.encode((byte[]) connection.getOne()));
+                if (!masters.isEmpty()) {
+                    return masters;
+                }
+                failures.add(new IllegalStateException("Seed node " + seed + " returned no healthy master nodes"));
+            }
+            catch (RuntimeException e) {
+                log.warn(e, "Failed to discover Redis cluster master nodes from seed %s", seed);
+                failures.add(e);
+            }
+        }
+        RuntimeException exception = new IllegalStateException(
+                "Unable to discover Redis cluster master nodes from any configured seed node: " + seedNodes);
+        failures.forEach(exception::addSuppressed);
+        throw exception;
+    }
+
+    static Set<HostAddress> parseClusterMasterNodes(String clusterNodes)
+    {
+        ImmutableSet.Builder<HostAddress> masters = ImmutableSet.builder();
+        for (String line : clusterNodes.split("\n")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            String[] parts = trimmed.split("\\s+");
+            // CLUSTER NODES format: <id> <ip:port@bus-port> <flags> ...
+            // flags field contains "master" for master nodes and "slave" for replicas
+            if (parts.length >= 3 && parts[2].contains("master") && !parts[2].contains("fail")) {
+                String hostPort = parts[1].split("@")[0];
+                masters.add(HostAddress.fromString(hostPort));
+            }
+        }
+        return masters.build();
+    }
+
     private RedisClient createClient(HostAddress host)
     {
         log.info("Creating new RedisClient for %s", host);
 
-        DefaultJedisClientConfig.Builder clientConfigBuilder = DefaultJedisClientConfig.builder()
-                .connectionTimeoutMillis(toIntExact(redisConnectTimeout.toMillis()))
-                .socketTimeoutMillis(toIntExact(redisConnectTimeout.toMillis()))
-                .database(redisDataBaseIndex);
-
-        if (redisUser != null && !redisUser.isEmpty()) {
-            clientConfigBuilder.user(redisUser);
-        }
-        if (redisPassword != null && !redisPassword.isEmpty()) {
-            clientConfigBuilder.password(redisPassword);
-        }
-
-        clientConfigurators.forEach(configurator -> configurator.configure(clientConfigBuilder));
+        DefaultJedisClientConfig clientConfig = baseClientConfigBuilder()
+                .database(redisDataBaseIndex)
+                .build();
 
         return RedisClient.builder()
                 .hostAndPort(host.getHostText(), host.getPort())
-                .clientConfig(clientConfigBuilder.build())
+                .clientConfig(clientConfig)
                 .build();
+    }
+
+    private DefaultJedisClientConfig.Builder baseClientConfigBuilder()
+    {
+        DefaultJedisClientConfig.Builder builder = DefaultJedisClientConfig.builder()
+                .connectionTimeoutMillis(toIntExact(redisConnectTimeout.toMillis()))
+                .socketTimeoutMillis(toIntExact(redisConnectTimeout.toMillis()));
+        if (redisUser != null && !redisUser.isEmpty()) {
+            builder.user(redisUser);
+        }
+        if (redisPassword != null && !redisPassword.isEmpty()) {
+            builder.password(redisPassword);
+        }
+        clientConfigurators.forEach(configurator -> configurator.configure(builder));
+        return builder;
     }
 }

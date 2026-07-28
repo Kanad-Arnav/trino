@@ -23,8 +23,8 @@ import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.testing.AbstractTestingTrinoClient;
 import io.trino.testing.ResultsSession;
-import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.RedisClient;
+import redis.clients.jedis.RedisClusterClient;
 
 import java.util.List;
 import java.util.Map;
@@ -44,7 +44,7 @@ public class RedisLoader
         extends AbstractTestingTrinoClient<Void>
 {
     private final RedisClient client;
-    private final JedisCluster jedisCluster;
+    private final RedisClusterClient redisClusterClient;
     private final String tableName;
     private final String dataFormat;
     private final AtomicLong count = new AtomicLong();
@@ -75,31 +75,31 @@ public class RedisLoader
     public RedisLoader(
             TestingTrinoServer trinoServer,
             Session defaultSession,
-            JedisCluster jedisCluster,
+            RedisClusterClient redisClusterClient,
             String tableName,
             String dataFormat,
             boolean clusterMode)
     {
-        this(trinoServer, defaultSession, null, jedisCluster, tableName, dataFormat, clusterMode);
+        this(trinoServer, defaultSession, null, redisClusterClient, tableName, dataFormat, clusterMode);
     }
 
     private RedisLoader(
             TestingTrinoServer trinoServer,
             Session defaultSession,
             RedisClient client,
-            JedisCluster jedisCluster,
+            RedisClusterClient redisClusterClient,
             String tableName,
             String dataFormat,
             boolean clusterMode)
     {
         super(trinoServer, defaultSession);
         this.client = client;
-        this.jedisCluster = jedisCluster;
+        this.redisClusterClient = redisClusterClient;
         this.tableName = tableName;
         this.dataFormat = dataFormat;
         this.clusterMode = clusterMode;
         jsonEncoder = new JsonEncoder();
-        checkState(clusterMode ? jedisCluster != null : client != null, "client or jedisCluster must be non-null");
+        checkState(clusterMode ? redisClusterClient != null : client != null, "client or redisClusterClient must be non-null");
     }
 
     @Override
@@ -192,7 +192,7 @@ public class RedisLoader
         private void setClusterAware(String key, String value)
         {
             if (clusterMode) {
-                jedisCluster.set(key, value);
+                redisClusterClient.set(key, value);
             }
             else {
                 client.set(key, value);
@@ -202,7 +202,7 @@ public class RedisLoader
         private void hsetClusterAware(String key, String field, String value)
         {
             if (clusterMode) {
-                jedisCluster.hset(key, field, value);
+                redisClusterClient.hset(key, field, value);
             }
             else {
                 client.hset(key, field, value);

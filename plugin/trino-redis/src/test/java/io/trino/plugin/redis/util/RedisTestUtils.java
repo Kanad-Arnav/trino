@@ -78,7 +78,7 @@ public final class RedisTestUtils
 
     public static void loadTpchTable(RedisCluster redisCluster, TestingTrinoClient trinoClient, String tableName, QualifiedObjectName tpchTableName, String dataFormat, boolean clusterMode)
     {
-        RedisLoader tpchLoader = new RedisLoader(trinoClient.getServer(), trinoClient.getDefaultSession(), redisCluster.getJedisCluster(), tableName, dataFormat, clusterMode);
+        RedisLoader tpchLoader = new RedisLoader(trinoClient.getServer(), trinoClient.getDefaultSession(), redisCluster.getRedisClusterClient(), tableName, dataFormat, clusterMode);
         tpchLoader.execute(format("SELECT * from %s", tpchTableName));
     }
 

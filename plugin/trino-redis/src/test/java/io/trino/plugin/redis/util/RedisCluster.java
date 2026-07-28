@@ -20,9 +20,9 @@ import org.testcontainers.containers.GenericContainer;
 import redis.clients.jedis.Connection;
 import redis.clients.jedis.DefaultJedisClientConfig;
 import redis.clients.jedis.HostAndPort;
-import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.Protocol;
 import redis.clients.jedis.RedisClient;
+import redis.clients.jedis.RedisClusterClient;
 import redis.clients.jedis.util.SafeEncoder;
 
 import java.io.Closeable;
@@ -55,7 +55,7 @@ public class RedisCluster
     private final List<RedisClient> clients;
     private final List<HostAndPort> jedisSeedAddresses;
     private final List<com.google.common.net.HostAndPort> seedAddresses;
-    private final JedisCluster jedisCluster;
+    private final RedisClusterClient redisClusterClient;
 
     public RedisCluster()
     {
@@ -105,8 +105,8 @@ public class RedisCluster
         // Form the cluster: MEET all nodes, then distribute slots
         formCluster(numPrimaries);
 
-        // Create JedisCluster for cluster-aware data loading
-        jedisCluster = new JedisCluster(ImmutableSet.copyOf(jedisSeedAddresses));
+        // Create RedisClusterClient for cluster-aware data loading
+        redisClusterClient = RedisClusterClient.create(ImmutableSet.copyOf(jedisSeedAddresses));
     }
 
     private void formCluster(int numPrimaries)
@@ -207,11 +207,11 @@ public class RedisCluster
     }
 
     /**
-     * Returns a {@link JedisCluster} client for cluster-aware data loading.
+     * Returns a {@link RedisClusterClient} for cluster-aware data loading.
      */
-    public JedisCluster getJedisCluster()
+    public RedisClusterClient getRedisClusterClient()
     {
-        return jedisCluster;
+        return redisClusterClient;
     }
 
     /**
@@ -229,7 +229,7 @@ public class RedisCluster
     public void close()
     {
         try {
-            jedisCluster.close();
+            redisClusterClient.close();
         }
         catch (Exception e) {
             // ignore

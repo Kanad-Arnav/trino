@@ -489,9 +489,17 @@ public class RedisRecordCursor
                                     "Malformed cluster redirection error for key " + key + ": " + jedisDataException.getMessage());
                         }
                         // Retry on the target node
-                        RedisClient targetClient = clientManager.getClient(target);
                         try {
-                            String value = targetClient.get(key);
+                            String value;
+                            if (RedisClientManager.isAskRedirection(jedisDataException)) {
+                                // ASK: slot is migrating, must send ASKING before command
+                                value = clientManager.askAndGet(target, key);
+                            }
+                            else {
+                                // MOVED: topology changed, retry with normal GET on target
+                                RedisClient targetClient = clientManager.getClient(target);
+                                value = targetClient.get(key);
+                            }
                             results[originalIndex] = value;
                         }
                         catch (JedisDataException retryException) {
@@ -570,9 +578,17 @@ public class RedisRecordCursor
                             throw new TrinoException(GENERIC_INTERNAL_ERROR,
                                     "Malformed cluster redirection error for key " + key + ": " + jedisDataException.getMessage());
                         }
-                        RedisClient targetClient = clientManager.getClient(target);
                         try {
-                            Map<String, String> value = targetClient.hgetAll(key);
+                            Map<String, String> value;
+                            if (RedisClientManager.isAskRedirection(jedisDataException)) {
+                                // ASK: slot is migrating, must send ASKING before command
+                                value = clientManager.askAndGetAll(target, key);
+                            }
+                            else {
+                                // MOVED: topology changed, retry with normal HGETALL on target
+                                RedisClient targetClient = clientManager.getClient(target);
+                                value = targetClient.hgetAll(key);
+                            }
                             results[originalIndex] = value;
                         }
                         catch (JedisDataException retryException) {

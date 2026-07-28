@@ -19,11 +19,20 @@ import io.airlift.log.Logger;
 import io.airlift.units.Duration;
 import io.trino.spi.HostAddress;
 import jakarta.annotation.PreDestroy;
+import redis.clients.jedis.CommandArguments;
+import redis.clients.jedis.Connection;
 import redis.clients.jedis.DefaultJedisClientConfig;
+import redis.clients.jedis.HostAndPort;
+import redis.clients.jedis.Protocol;
 import redis.clients.jedis.RedisClient;
 import redis.clients.jedis.exceptions.JedisDataException;
 import redis.clients.jedis.util.JedisClusterCRC16;
+import redis.clients.jedis.util.SafeEncoder;
 
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -141,11 +150,32 @@ public class RedisClientManager
     /**
      * Forces a re-discovery of the cluster topology from the seed nodes.
      * Called after a MOVED redirect indicates the cached topology is stale.
+     * Clients for primaries that are no longer in the new topology are closed
+     * and removed from the cache to avoid leaking connections to departed nodes.
      */
     public RedisClusterTopology refreshTopology()
     {
+        RedisClusterTopology oldTopology = clusterTopology.get();
         RedisClusterTopology newTopology = RedisClusterTopology.discover(seedNodes, baseClientConfigBuilder().build());
         clusterTopology.set(newTopology);
+
+        // Close clients for primaries that are no longer in the topology
+        if (oldTopology != null) {
+            Set<HostAddress> stalePrimaries = new HashSet<>(oldTopology.getPrimaries());
+            stalePrimaries.removeAll(newTopology.getPrimaries());
+            for (HostAddress stale : stalePrimaries) {
+                RedisClient staleClient = clientCache.remove(stale);
+                if (staleClient != null) {
+                    try {
+                        staleClient.close();
+                        log.info("Closed stale RedisClient for departed primary %s", stale);
+                    }
+                    catch (Exception e) {
+                        log.warn(e, "While closing stale RedisClient for %s:", stale);
+                    }
+                }
+            }
+        }
         return newTopology;
     }
 
@@ -220,6 +250,57 @@ public class RedisClientManager
     {
         String message = exception.getMessage();
         return message != null && message.startsWith("ASK");
+    }
+
+    /**
+     * Sends ASKING followed by GET on a fresh connection to the target node.
+     * Required for ASK redirects where the slot is in migrating state.
+     *
+     * @return the string value, or null if the key does not exist
+     */
+    public String askAndGet(HostAddress target, String key)
+    {
+        DefaultJedisClientConfig clientConfig = baseClientConfigBuilder().build();
+        try (Connection connection = new Connection(
+                new HostAndPort(target.getHostText(), target.getPort()),
+                clientConfig)) {
+            connection.sendCommand(new CommandArguments(Protocol.Command.ASKING));
+            connection.getStatusCodeReply();
+            connection.sendCommand(new CommandArguments(Protocol.Command.GET).add(key));
+            Object reply = connection.getOne();
+            return reply == null ? null : SafeEncoder.encode((byte[]) reply);
+        }
+    }
+
+    /**
+     * Sends ASKING followed by HGETALL on a fresh connection to the target node.
+     * Required for ASK redirects where the slot is in migrating state.
+     *
+     * @return a map of field names to values, or an empty map if the key does not exist
+     */
+    public Map<String, String> askAndGetAll(HostAddress target, String key)
+    {
+        DefaultJedisClientConfig clientConfig = baseClientConfigBuilder().build();
+        try (Connection connection = new Connection(
+                new HostAndPort(target.getHostText(), target.getPort()),
+                clientConfig)) {
+            connection.sendCommand(new CommandArguments(Protocol.Command.ASKING));
+            connection.getStatusCodeReply();
+            connection.sendCommand(new CommandArguments(Protocol.Command.HGETALL).add(key));
+            Object reply = connection.getOne();
+            if (reply == null) {
+                return Map.of();
+            }
+            @SuppressWarnings("unchecked")
+            List<Object> entries = (List<Object>) reply;
+            Map<String, String> result = new HashMap<>();
+            for (int i = 0; i + 1 < entries.size(); i += 2) {
+                String field = SafeEncoder.encode((byte[]) entries.get(i));
+                String value = SafeEncoder.encode((byte[]) entries.get(i + 1));
+                result.put(field, value);
+            }
+            return result;
+        }
     }
 
     private RedisClient createClient(HostAddress host)

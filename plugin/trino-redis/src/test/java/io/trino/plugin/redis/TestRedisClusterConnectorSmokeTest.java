@@ -30,6 +30,7 @@ final class TestRedisClusterConnectorSmokeTest
         return RedisQueryRunner.builder(redisServer)
                 .addConnectorProperties(ImmutableMap.of("redis.cluster.enabled", "true"))
                 .setDataFormat("string")
+                .setClusterMode(true)
                 .setInitialTables(REQUIRED_TPCH_TABLES)
                 .build();
     }

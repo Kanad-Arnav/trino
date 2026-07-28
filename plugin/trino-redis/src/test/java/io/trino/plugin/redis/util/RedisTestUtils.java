@@ -56,6 +56,12 @@ public final class RedisTestUtils
         tpchLoader.execute(format("SELECT * from %s", tpchTableName));
     }
 
+    public static void loadTpchTable(RedisServer redisServer, TestingTrinoClient trinoClient, String tableName, QualifiedObjectName tpchTableName, String dataFormat, boolean clusterMode)
+    {
+        RedisLoader tpchLoader = new RedisLoader(trinoClient.getServer(), trinoClient.getDefaultSession(), redisServer.getClient(), tableName, dataFormat, clusterMode);
+        tpchLoader.execute(format("SELECT * from %s", tpchTableName));
+    }
+
     public static Map.Entry<SchemaTableName, RedisTableDescription> loadTpchTableDescription(
             JsonCodec<RedisTableDescription> tableDescriptionJsonCodec,
             SchemaTableName schemaTableName,

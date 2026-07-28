@@ -16,66 +16,92 @@ package io.trino.plugin.redis;
 import io.trino.spi.HostAddress;
 import org.junit.jupiter.api.Test;
 
-import java.util.Set;
+import java.util.List;
 
-import static io.trino.plugin.redis.RedisClientManager.parseClusterMasterNodes;
+import static io.trino.plugin.redis.RedisClusterTopology.parseClusterSlots;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 final class TestRedisClusterNodeDiscovery
 {
     @Test
-    void testDiscoversAllHealthyMastersAcrossShards()
+    void testParseClusterSlotsThreeMasters()
     {
-        // Realistic CLUSTER NODES output for a 3-master, 3-replica cluster.
-        String clusterNodes = """
-                07c37dfeb235213a872192d90877d0cd55635b91 127.0.0.1:30004@31004 slave e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 0 1426238317239 4 connected
-                67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 127.0.0.1:30002@31002 master - 0 1426238316232 2 connected 5461-10922
-                292f8b365bb7edb5e285caf0b7e6ddc7265d2f4f 127.0.0.1:30003@31003 master - 0 1426238318243 3 connected 10923-16383
-                6ec23923021cf3ffec47632106199cb7f496ce01 127.0.0.1:30005@31005 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 0 1426238316232 5 connected
-                824fe116063bc5fcf9f4ffd895bc17aee7731ac3 127.0.0.1:30006@31006 slave 292f8b365bb7edb5e285caf0b7e6ddc7265d2f4f 0 1426238317741 6 connected
-                e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 127.0.0.1:30001@31001 myself,master - 0 0 1 connected 0-5460
-                """;
+        // Simulates CLUSTER SLOTS RESP response for a 3-master cluster:
+        // [startSlot, endSlot, [ip, port, id], [replicaIp, replicaPort, replicaId], ...]
+        List<Object> response = List.of(
+                List.of(0L, 5460L, List.of("127.0.0.1".getBytes(), 30001L, "master-id-1".getBytes()), List.of("127.0.0.1".getBytes(), 30004L, "replica-id-1".getBytes())),
+                List.of(5461L, 10922L, List.of("127.0.0.1".getBytes(), 30002L, "master-id-2".getBytes()), List.of("127.0.0.1".getBytes(), 30005L, "replica-id-2".getBytes())),
+                List.of(10923L, 16383L, List.of("127.0.0.1".getBytes(), 30003L, "master-id-3".getBytes()), List.of("127.0.0.1".getBytes(), 30006L, "replica-id-3".getBytes())));
 
-        assertThat(parseClusterMasterNodes(clusterNodes)).containsExactlyInAnyOrder(
+        RedisClusterTopology topology = parseClusterSlots(response);
+
+        assertThat(topology.isComplete()).isTrue();
+        assertThat(topology.getPrimaries()).containsExactlyInAnyOrder(
                 HostAddress.fromParts("127.0.0.1", 30001),
                 HostAddress.fromParts("127.0.0.1", 30002),
                 HostAddress.fromParts("127.0.0.1", 30003));
     }
 
     @Test
-    void testExcludesFailedMasters()
+    void testSlotRouting()
     {
-        String clusterNodes = """
-                aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 127.0.0.1:30001@31001 master - 0 1426238316232 1 connected 0-8191
-                bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 127.0.0.1:30002@31002 master,fail - 0 1426238317741 2 disconnected 8192-16383
-                """;
+        List<Object> response = List.of(
+                List.of(0L, 5460L, List.of("127.0.0.1".getBytes(), 30001L, "id-1".getBytes())),
+                List.of(5461L, 10922L, List.of("127.0.0.1".getBytes(), 30002L, "id-2".getBytes())),
+                List.of(10923L, 16383L, List.of("127.0.0.1".getBytes(), 30003L, "id-3".getBytes())));
 
-        assertThat(parseClusterMasterNodes(clusterNodes)).containsExactly(
-                HostAddress.fromParts("127.0.0.1", 30001));
+        RedisClusterTopology topology = parseClusterSlots(response);
+
+        // Slot 0 should route to primary at 30001
+        assertThat(topology.getPrimaryForSlot(0)).isEqualTo(HostAddress.fromParts("127.0.0.1", 30001));
+        // Slot 5461 should route to primary at 30002
+        assertThat(topology.getPrimaryForSlot(5461)).isEqualTo(HostAddress.fromParts("127.0.0.1", 30002));
+        // Slot 10923 should route to primary at 30003
+        assertThat(topology.getPrimaryForSlot(10923)).isEqualTo(HostAddress.fromParts("127.0.0.1", 30003));
     }
 
     @Test
-    void testIgnoresBlankAndMalformedLines()
+    void testIncompleteTopology()
     {
-        String clusterNodes = """
+        // Only covers slots 0-8191, missing 8192-16383
+        List<Object> response = List.of(
+                List.of(0L, 8191L, List.of("127.0.0.1".getBytes(), 30001L, "id-1".getBytes())));
 
-                cccccccccccccccccccccccccccccccccccccccc 127.0.0.1:30001@31001 myself,master - 0 0 1 connected 0-16383
+        RedisClusterTopology topology = parseClusterSlots(response);
 
-                incomplete-line
-                """;
-
-        assertThat(parseClusterMasterNodes(clusterNodes)).containsExactly(
-                HostAddress.fromParts("127.0.0.1", 30001));
+        assertThat(topology.isComplete()).isFalse();
+        assertThat(topology.getPrimaries()).containsExactly(HostAddress.fromParts("127.0.0.1", 30001));
+        // Accessing an unassigned slot should fail
+        assertThatThrownBy(() -> topology.getPrimaryForSlot(8192))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("no primary assigned for slot");
     }
 
     @Test
-    void testReturnsEmptyWhenNoMasters()
+    void testEmptyResponse()
     {
-        String clusterNodes = """
-                dddddddddddddddddddddddddddddddddddddddd 127.0.0.1:30004@31004 slave e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 0 1426238317239 4 connected
-                """;
+        List<Object> response = List.of();
 
-        Set<HostAddress> masters = parseClusterMasterNodes(clusterNodes);
-        assertThat(masters).isEmpty();
+        RedisClusterTopology topology = parseClusterSlots(response);
+
+        assertThat(topology.isComplete()).isFalse();
+        assertThat(topology.getPrimaries()).isEmpty();
+    }
+
+    @Test
+    void testSinglePrimaryOwnsAllSlots()
+    {
+        List<Object> response = List.of(
+                List.of(0L, 16383L, List.of("127.0.0.1".getBytes(), 6379L, "single-master".getBytes())));
+
+        RedisClusterTopology topology = parseClusterSlots(response);
+
+        assertThat(topology.isComplete()).isTrue();
+        assertThat(topology.getPrimaries()).containsExactly(HostAddress.fromParts("127.0.0.1", 6379));
+        // Every slot should route to the single primary
+        for (int slot = 0; slot < RedisClusterTopology.TOTAL_SLOTS; slot += 1000) {
+            assertThat(topology.getPrimaryForSlot(slot)).isEqualTo(HostAddress.fromParts("127.0.0.1", 6379));
+        }
     }
 }

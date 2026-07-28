@@ -19,20 +19,16 @@ import io.airlift.log.Logger;
 import io.airlift.units.Duration;
 import io.trino.spi.HostAddress;
 import jakarta.annotation.PreDestroy;
-import redis.clients.jedis.CommandArguments;
-import redis.clients.jedis.Connection;
 import redis.clients.jedis.DefaultJedisClientConfig;
-import redis.clients.jedis.HostAndPort;
-import redis.clients.jedis.Protocol;
 import redis.clients.jedis.RedisClient;
-import redis.clients.jedis.util.SafeEncoder;
+import redis.clients.jedis.exceptions.JedisDataException;
+import redis.clients.jedis.util.JedisClusterCRC16;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static java.lang.Math.toIntExact;
@@ -58,6 +54,8 @@ public class RedisClientManager
     private final Set<RedisClientConfigurator> clientConfigurators;
     private final Set<HostAddress> seedNodes;
     private final boolean clusterEnabled;
+
+    private final AtomicReference<RedisClusterTopology> clusterTopology = new AtomicReference<>();
 
     @Inject
     RedisClientManager(RedisConnectorConfig redisConnectorConfig, Set<RedisClientConfigurator> clientConfigurators)
@@ -90,6 +88,7 @@ public class RedisClientManager
                 log.warn(e, "While closing RedisClient %s:", entry.getKey());
             }
         }
+        clusterTopology.set(null);
     }
 
     public char getRedisKeyDelimiter()
@@ -124,56 +123,103 @@ public class RedisClientManager
     }
 
     /**
-     * Discovers all master nodes in a Redis Cluster via the CLUSTER NODES command.
-     * Uses a low-level Connection to send the raw command, since clusterNodes() was
-     * removed from high-level Jedis 7.x clients.
-     * Each seed node from redis.nodes is tried in turn until one responds, so discovery
-     * does not depend on the availability of a single seed.
-     * Only applicable when redis.cluster.enabled=true.
+     * Returns the current cluster topology, discovering it from the seed nodes
+     * on first access.  Only applicable when {@code redis.cluster.enabled=true}.
      */
-    public Set<HostAddress> getClusterMasterNodes()
+    public RedisClusterTopology getClusterTopology()
     {
-        DefaultJedisClientConfig clientConfig = baseClientConfigBuilder().build();
-        List<Exception> failures = new ArrayList<>();
-        for (HostAddress seed : seedNodes) {
-            try (Connection connection = new Connection(
-                    new HostAndPort(seed.getHostText(), seed.getPort()),
-                    clientConfig)) {
-                connection.sendCommand(new CommandArguments(Protocol.Command.CLUSTER).add("NODES"));
-                Set<HostAddress> masters = parseClusterMasterNodes(SafeEncoder.encode((byte[]) connection.getOne()));
-                if (!masters.isEmpty()) {
-                    return masters;
-                }
-                failures.add(new IllegalStateException("Seed node " + seed + " returned no healthy master nodes"));
-            }
-            catch (RuntimeException e) {
-                log.warn(e, "Failed to discover Redis cluster master nodes from seed %s", seed);
-                failures.add(e);
+        RedisClusterTopology topology = clusterTopology.get();
+        if (topology == null) {
+            topology = RedisClusterTopology.discover(seedNodes, baseClientConfigBuilder().build());
+            if (!clusterTopology.compareAndSet(null, topology)) {
+                topology = clusterTopology.get();
             }
         }
-        RuntimeException exception = new IllegalStateException(
-                "Unable to discover Redis cluster master nodes from any configured seed node: " + seedNodes);
-        failures.forEach(exception::addSuppressed);
-        throw exception;
+        return topology;
     }
 
-    static Set<HostAddress> parseClusterMasterNodes(String clusterNodes)
+    /**
+     * Forces a re-discovery of the cluster topology from the seed nodes.
+     * Called after a MOVED redirect indicates the cached topology is stale.
+     */
+    public RedisClusterTopology refreshTopology()
     {
-        ImmutableSet.Builder<HostAddress> masters = ImmutableSet.builder();
-        for (String line : clusterNodes.split("\n")) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            String[] parts = trimmed.split("\\s+");
-            // CLUSTER NODES format: <id> <ip:port@bus-port> <flags> ...
-            // flags field contains "master" for master nodes and "slave" for replicas
-            if (parts.length >= 3 && parts[2].contains("master") && !parts[2].contains("fail")) {
-                String hostPort = parts[1].split("@")[0];
-                masters.add(HostAddress.fromString(hostPort));
-            }
+        RedisClusterTopology newTopology = RedisClusterTopology.discover(seedNodes, baseClientConfigBuilder().build());
+        clusterTopology.set(newTopology);
+        return newTopology;
+    }
+
+    /**
+     * Returns the primary node that owns the slot for the given key.
+     */
+    public HostAddress getPrimaryForKey(String key)
+    {
+        return getClusterTopology().getPrimaryForKey(key);
+    }
+
+    /**
+     * Returns a client for the primary that owns the slot for the given key.
+     */
+    public RedisClient getClientForKey(String key)
+    {
+        return getClient(getPrimaryForKey(key));
+    }
+
+    /**
+     * Returns the Redis hash slot for the given key.
+     */
+    public static int getSlot(String key)
+    {
+        return JedisClusterCRC16.getSlot(key);
+    }
+
+    /**
+     * Parses a MOVED or ASK redirection error and returns the target host.
+     *
+     * @return the target HostAddress, or null if the exception is not a redirection
+     */
+    public static HostAddress parseRedirectionTarget(JedisDataException exception)
+    {
+        String message = exception.getMessage();
+        if (message == null) {
+            return null;
         }
-        return masters.build();
+        // Format: "MOVED <slot> <ip:port>" or "ASK <slot> <ip:port>"
+        if (!message.startsWith("MOVED") && !message.startsWith("ASK")) {
+            return null;
+        }
+        String[] parts = message.split("\\s+");
+        if (parts.length < 3) {
+            return null;
+        }
+        return HostAddress.fromString(parts[2]).withDefaultPort(6379);
+    }
+
+    /**
+     * Returns true if the given exception is a MOVED or ASK redirection.
+     */
+    public static boolean isRedirectionError(JedisDataException exception)
+    {
+        String message = exception.getMessage();
+        return message != null && (message.startsWith("MOVED") || message.startsWith("ASK"));
+    }
+
+    /**
+     * Returns true if the given exception is a MOVED redirection (topology change).
+     */
+    public static boolean isMovedRedirection(JedisDataException exception)
+    {
+        String message = exception.getMessage();
+        return message != null && message.startsWith("MOVED");
+    }
+
+    /**
+     * Returns true if the given exception is an ASK redirection (temporary).
+     */
+    public static boolean isAskRedirection(JedisDataException exception)
+    {
+        String message = exception.getMessage();
+        return message != null && message.startsWith("ASK");
     }
 
     private RedisClient createClient(HostAddress host)

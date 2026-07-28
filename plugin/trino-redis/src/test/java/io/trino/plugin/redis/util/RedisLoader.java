@@ -24,6 +24,7 @@ import io.trino.spi.type.VarcharType;
 import io.trino.testing.AbstractTestingTrinoClient;
 import io.trino.testing.ResultsSession;
 import redis.clients.jedis.RedisClient;
+import redis.clients.jedis.exceptions.JedisDataException;
 
 import java.util.List;
 import java.util.Map;
@@ -47,6 +48,7 @@ public class RedisLoader
     private final String dataFormat;
     private final AtomicLong count = new AtomicLong();
     private final JsonEncoder jsonEncoder;
+    private final boolean clusterMode;
 
     public RedisLoader(
             TestingTrinoServer trinoServer,
@@ -55,10 +57,22 @@ public class RedisLoader
             String tableName,
             String dataFormat)
     {
+        this(trinoServer, defaultSession, client, tableName, dataFormat, false);
+    }
+
+    public RedisLoader(
+            TestingTrinoServer trinoServer,
+            Session defaultSession,
+            RedisClient client,
+            String tableName,
+            String dataFormat,
+            boolean clusterMode)
+    {
         super(trinoServer, defaultSession);
         this.client = requireNonNull(client, "client is null");
         this.tableName = tableName;
         this.dataFormat = dataFormat;
+        this.clusterMode = clusterMode;
         jsonEncoder = new JsonEncoder();
     }
 
@@ -100,16 +114,18 @@ public class RedisLoader
                                 builder.put(columns.get(i).getName(), value);
                             }
                         }
-                        client.set(redisKey, jsonEncoder.toString(builder.buildOrThrow()));
+                        setClusterAware(redisKey, jsonEncoder.toString(builder.buildOrThrow()));
                     }
                     case "hash" -> {
-                        // add keys to zset
-                        String redisZset = "keyset:" + tableName;
-                        client.zadd(redisZset, count.get(), redisKey);
+                        // add keys to zset (only in standalone mode; zset not supported in cluster)
+                        if (!clusterMode) {
+                            String redisZset = "keyset:" + tableName;
+                            client.zadd(redisZset, count.get(), redisKey);
+                        }
 
                         // add values to Hash
                         for (int i = 0; i < fields.size(); i++) {
-                            client.hset(redisKey, columns.get(i).getName(), fields.get(i).toString());
+                            hsetClusterAware(redisKey, columns.get(i).getName(), fields.get(i).toString());
                         }
                     }
                     default -> throw new AssertionError("unhandled value type: " + dataFormat);
@@ -145,6 +161,38 @@ public class RedisLoader
                 return value;
             }
             throw new AssertionError("unhandled type: " + type);
+        }
+
+        private void setClusterAware(String key, String value)
+        {
+            if (clusterMode) {
+                try {
+                    client.set(key, value);
+                }
+                catch (JedisDataException e) {
+                    // In cluster mode, the direct client may get MOVED/ASK.
+                    // Retry by inserting with braces to force the correct slot.
+                    throw e;
+                }
+            }
+            else {
+                client.set(key, value);
+            }
+        }
+
+        private void hsetClusterAware(String key, String field, String value)
+        {
+            if (clusterMode) {
+                try {
+                    client.hset(key, field, value);
+                }
+                catch (JedisDataException e) {
+                    throw e;
+                }
+            }
+            else {
+                client.hset(key, field, value);
+            }
         }
     }
 }

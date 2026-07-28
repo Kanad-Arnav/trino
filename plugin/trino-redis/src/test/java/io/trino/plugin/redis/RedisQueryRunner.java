@@ -63,6 +63,7 @@ public final class RedisQueryRunner
         private final Map<String, String> connectorProperties = new HashMap<>();
         private String dataFormat;
         private List<TpchTable<?>> initialTables = ImmutableList.of();
+        private boolean clusterMode;
 
         private Builder(RedisServer redisServer)
         {
@@ -94,6 +95,13 @@ public final class RedisQueryRunner
             return this;
         }
 
+        @CanIgnoreReturnValue
+        public Builder setClusterMode(boolean clusterMode)
+        {
+            this.clusterMode = clusterMode;
+            return this;
+        }
+
         @Override
         public DistributedQueryRunner build()
                 throws Exception
@@ -112,7 +120,7 @@ public final class RedisQueryRunner
                 log.info("Loading data...");
                 long startTime = System.nanoTime();
                 for (TpchTable<?> table : initialTables) {
-                    loadTpchTable(redisServer, trinoClient, table, dataFormat);
+                    loadTpchTable(redisServer, trinoClient, table, dataFormat, clusterMode);
                 }
                 log.info("Loading complete in %s", nanosSince(startTime).toString(SECONDS));
                 redisServer.closeClient();
@@ -125,7 +133,7 @@ public final class RedisQueryRunner
         }
     }
 
-    private static void loadTpchTable(RedisServer redisServer, TestingTrinoClient trinoClient, TpchTable<?> table, String dataFormat)
+    private static void loadTpchTable(RedisServer redisServer, TestingTrinoClient trinoClient, TpchTable<?> table, String dataFormat, boolean clusterMode)
     {
         long start = System.nanoTime();
         log.info("Running import for %s", table.getTableName());
@@ -134,7 +142,8 @@ public final class RedisQueryRunner
                 trinoClient,
                 redisTableName(table),
                 new QualifiedObjectName("tpch", TINY_SCHEMA_NAME, table.getTableName().toLowerCase(ENGLISH)),
-                dataFormat);
+                dataFormat,
+                clusterMode);
         log.info("Imported %s in %s", table.getTableName(), nanosSince(start).convertToMostSuccinctTimeUnit());
     }
 

@@ -178,7 +178,7 @@ public final class RedisSplit
                 + estimatedSizeOf(valueDataFormat)
                 + estimatedSizeOf(nodes, HostAddress::getRetainedSizeInBytes)
                 + constraint.getRetainedSizeInBytes(columnHandle -> ((RedisColumnHandle) columnHandle).getRetainedSizeInBytes())
-                + clusterKeys.map(keys -> estimatedSizeOf(keys, estimatedSizeOf)).orElse(0);
+                + clusterKeys.map(keys -> estimatedSizeOf(keys, key -> estimatedSizeOf(key))).orElse(0L);
     }
 
     public static RedisDataType toRedisDataType(String dataFormat)

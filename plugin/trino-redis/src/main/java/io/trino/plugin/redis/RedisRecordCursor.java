@@ -485,7 +485,8 @@ public class RedisRecordCursor
                     if (isRedirectionError(jedisDataException)) {
                         HostAddress target = RedisClientManager.parseRedirectionTarget(jedisDataException);
                         if (target == null) {
-                            throw new TrinoException(GENERIC_INTERNAL_ERROR,
+                            throw new TrinoException(
+                                    GENERIC_INTERNAL_ERROR,
                                     "Malformed cluster redirection error for key " + key + ": " + jedisDataException.getMessage());
                         }
                         // Retry on the target node
@@ -532,7 +533,8 @@ public class RedisRecordCursor
         }
 
         if (!pendingKeys.isEmpty()) {
-            throw new TrinoException(GENERIC_INTERNAL_ERROR,
+            throw new TrinoException(
+                    GENERIC_INTERNAL_ERROR,
                     "Exhausted " + MAX_REDIRECTION_RETRIES + " retries for cluster redirection(s) on keys: " + pendingKeys);
         }
 
@@ -575,7 +577,8 @@ public class RedisRecordCursor
                     if (isRedirectionError(jedisDataException)) {
                         HostAddress target = RedisClientManager.parseRedirectionTarget(jedisDataException);
                         if (target == null) {
-                            throw new TrinoException(GENERIC_INTERNAL_ERROR,
+                            throw new TrinoException(
+                                    GENERIC_INTERNAL_ERROR,
                                     "Malformed cluster redirection error for key " + key + ": " + jedisDataException.getMessage());
                         }
                         try {
@@ -619,7 +622,8 @@ public class RedisRecordCursor
         }
 
         if (!pendingKeys.isEmpty()) {
-            throw new TrinoException(GENERIC_INTERNAL_ERROR,
+            throw new TrinoException(
+                    GENERIC_INTERNAL_ERROR,
                     "Exhausted " + MAX_REDIRECTION_RETRIES + " retries for cluster redirection(s) on hash keys: " + pendingKeys);
         }
 

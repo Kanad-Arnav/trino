@@ -14,7 +14,7 @@
 package io.trino.plugin.redis;
 
 import com.google.common.collect.ImmutableMap;
-import io.trino.plugin.redis.util.RedisServer;
+import io.trino.plugin.redis.util.RedisCluster;
 import io.trino.testing.BaseConnectorSmokeTest;
 import io.trino.testing.QueryRunner;
 import io.trino.testing.TestingConnectorBehavior;
@@ -26,8 +26,8 @@ final class TestRedisClusterConnectorSmokeTest
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        RedisServer redisServer = closeAfterClass(RedisServer.createClusterServer());
-        return RedisQueryRunner.builder(redisServer)
+        RedisCluster redisCluster = closeAfterClass(new RedisCluster());
+        return RedisQueryRunner.builder(redisCluster)
                 .addConnectorProperties(ImmutableMap.of("redis.cluster.enabled", "true"))
                 .setDataFormat("string")
                 .setClusterMode(true)

@@ -71,15 +71,20 @@ public class RedisCluster
 
         // Build the command to start all Redis instances in a single container.
         // Each instance gets its own data directory to avoid AOF/cluster-config file conflicts.
-        StringBuilder command = new StringBuilder();
         List<Integer> ports = new ArrayList<>(numPrimaries);
         for (int i = 0; i < numPrimaries; i++) {
-            int port = basePort + i;
-            ports.add(port);
-            command.append("mkdir -p /data/").append(i).append(" && ");
-            if (i > 0) {
-                command.append(" & ");
-            }
+            ports.add(basePort + i);
+        }
+
+        StringBuilder command = new StringBuilder();
+        command.append("mkdir -p");
+        for (int i = 0; i < numPrimaries; i++) {
+            command.append(" /data/").append(i);
+        }
+        command.append("; ");
+
+        for (int i = 0; i < numPrimaries; i++) {
+            int port = ports.get(i);
             command.append("redis-server")
                     .append(" --port ").append(port)
                     .append(" --cluster-enabled yes")
@@ -87,8 +92,9 @@ public class RedisCluster
                     .append(" --cluster-node-timeout ").append(CLUSTER_TIMEOUT_MILLIS)
                     .append(" --dir /data/").append(i)
                     .append(" --appendonly no");
+            command.append(" & ");
         }
-        command.append(" & wait");
+        command.append("wait");
 
         // Expose all ports with fixed bindings so cluster-announce-port is reachable from the test JVM
         ImmutableList.Builder<String> portBindings = ImmutableList.builder();

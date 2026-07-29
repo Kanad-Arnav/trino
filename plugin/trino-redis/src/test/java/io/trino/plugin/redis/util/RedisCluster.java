@@ -447,6 +447,90 @@ public class RedisCluster
         waitForClusterReady();
     }
 
+    public void migrateSlot(int slot, int targetIndex)
+    {
+        int sourceIndex = getPrimaryIndexForSlot(slot);
+        String sourceNodeId = getNodeId(sourceIndex);
+        String targetNodeId = getNodeId(targetIndex);
+        RedisClient sourceClient = clients.get(sourceIndex);
+
+        try (Connection connection = sourceClient.getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "MIGRATING", targetNodeId);
+            connection.getStatusCodeReply();
+        }
+        try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "IMPORTING", sourceNodeId);
+            connection.getStatusCodeReply();
+        }
+
+        // Move all keys in the slot.  CLUSTER GETKEYSINSLOT has no cursor, so we
+        // delete each batch and call again until the slot is empty.
+        while (true) {
+            List<String> keys = getKeysInSlot(sourceClient, slot);
+            if (keys.isEmpty()) {
+                break;
+            }
+            for (String key : keys) {
+                byte[] valueBytes;
+                long ttlMillis;
+                try (Connection connection = sourceClient.getPool().getResource()) {
+                    connection.sendCommand(new CommandArguments(Protocol.Command.DUMP).add(key));
+                    Object reply = connection.getOne();
+                    valueBytes = (byte[]) reply;
+                    connection.sendCommand(Protocol.Command.PTTL, key);
+                    Object pttl = connection.getOne();
+                    ttlMillis = pttl == null ? -1 : ((Long) pttl);
+                }
+                if (valueBytes != null) {
+                    try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+                        connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
+                                .add(key)
+                                .add(ttlMillis == -1 ? 0L : ttlMillis)
+                                .add(valueBytes)
+                                .add("REPLACE"));
+                        connection.getStatusCodeReply();
+                    }
+                    try (Connection connection = sourceClient.getPool().getResource()) {
+                        connection.sendCommand(Protocol.Command.DEL, key);
+                        connection.getIntegerReply();
+                    }
+                }
+            }
+        }
+
+        // Finalize ownership on all primaries
+        for (RedisClient client : clients) {
+            try (Connection connection = client.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "NODE", targetNodeId);
+                connection.getStatusCodeReply();
+            }
+        }
+
+        waitForClusterReady();
+    }
+
+    private List<String> getKeysInSlot(RedisClient client, int slot)
+    {
+        try (Connection connection = client.getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "GETKEYSINSLOT", Integer.toString(slot), "1000");
+            Object reply = connection.getOne();
+            if (reply == null) {
+                return List.of();
+            }
+            checkState(reply instanceof List, "CLUSTER GETKEYSINSLOT returned unexpected type: %s", reply.getClass());
+            @SuppressWarnings("unchecked")
+            List<Object> entries = (List<Object>) reply;
+            if (entries.isEmpty()) {
+                return List.of();
+            }
+            List<String> keys = new ArrayList<>(entries.size());
+            for (Object entry : entries) {
+                keys.add(SafeEncoder.encode((byte[]) entry));
+            }
+            return keys;
+        }
+    }
+
     public void prepareAskingSlot(String key, int sourceIndex, int targetIndex)
     {
         int slot = getKeySlot(key);

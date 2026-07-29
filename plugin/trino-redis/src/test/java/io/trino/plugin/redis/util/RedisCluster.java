@@ -423,6 +423,10 @@ public class RedisCluster
 
         if (valueBytes != null) {
             try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+                // ASKING allows the importing target to accept the next command
+                // for a slot it does not yet own.
+                connection.sendCommand(Protocol.Command.ASKING);
+                connection.getStatusCodeReply();
                 connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
                         .add(key)
                         .add(ttlMillis == -1 ? 0L : ttlMillis)
@@ -452,12 +456,13 @@ public class RedisCluster
         String sourceNodeId = getNodeId(sourceIndex);
         String targetNodeId = getNodeId(targetIndex);
         RedisClient sourceClient = clients.get(sourceIndex);
+        RedisClient targetClient = clients.get(targetIndex);
 
         try (Connection connection = sourceClient.getPool().getResource()) {
             connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "MIGRATING", targetNodeId);
             connection.getStatusCodeReply();
         }
-        try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+        try (Connection connection = targetClient.getPool().getResource()) {
             connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "IMPORTING", sourceNodeId);
             connection.getStatusCodeReply();
         }
@@ -481,7 +486,9 @@ public class RedisCluster
                     ttlMillis = pttl == null ? -1 : ((Long) pttl);
                 }
                 if (valueBytes != null) {
-                    try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+                    try (Connection connection = targetClient.getPool().getResource()) {
+                        connection.sendCommand(Protocol.Command.ASKING);
+                        connection.getStatusCodeReply();
                         connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
                                 .add(key)
                                 .add(ttlMillis == -1 ? 0L : ttlMillis)
@@ -563,6 +570,10 @@ public class RedisCluster
 
         if (valueBytes != null) {
             try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+                // ASKING allows the importing target to accept the next command
+                // for a slot it does not yet own.
+                connection.sendCommand(Protocol.Command.ASKING);
+                connection.getStatusCodeReply();
                 connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
                         .add(key)
                         .add(ttlMillis == -1 ? 0L : ttlMillis)

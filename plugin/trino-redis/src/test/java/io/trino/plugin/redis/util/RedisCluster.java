@@ -17,6 +17,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import io.trino.plugin.redis.RedisClusterTopology;
 import org.testcontainers.containers.GenericContainer;
+import redis.clients.jedis.CommandArguments;
 import redis.clients.jedis.Connection;
 import redis.clients.jedis.DefaultJedisClientConfig;
 import redis.clients.jedis.HostAndPort;
@@ -285,6 +286,190 @@ public class RedisCluster
     public RedisClient getClient()
     {
         return clients.get(0);
+    }
+
+    /**
+     * Returns a {@link RedisClient} connected to the primary at the given index.
+     */
+    public RedisClient getClient(int index)
+    {
+        return clients.get(index);
+    }
+
+    /**
+     * Returns the client port of the primary at the given index.
+     */
+    public int getPort(int index)
+    {
+        return jedisSeedAddresses.get(index).getPort();
+    }
+
+    public int getKeySlot(String key)
+    {
+        try (Connection connection = clients.get(0).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "KEYSLOT", key);
+            Object reply = connection.getOne();
+            checkState(reply != null, "CLUSTER KEYSLOT returned null for %s", key);
+            return ((Long) reply).intValue();
+        }
+    }
+
+    public int getPrimaryIndexForSlot(int slot)
+    {
+        try (Connection connection = clients.get(0).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "SLOTS");
+            Object response = connection.getOne();
+            checkState(response instanceof List, "CLUSTER SLOTS returned unexpected type: %s", response.getClass());
+            @SuppressWarnings("unchecked")
+            List<Object> slotRanges = (List<Object>) response;
+            for (Object slotRangeObj : slotRanges) {
+                @SuppressWarnings("unchecked")
+                List<Object> slotRange = (List<Object>) slotRangeObj;
+                int startSlot = ((Long) slotRange.get(0)).intValue();
+                int endSlot = ((Long) slotRange.get(1)).intValue();
+                if (slot >= startSlot && slot <= endSlot) {
+                    @SuppressWarnings("unchecked")
+                    List<Object> masterInfo = (List<Object>) slotRange.get(2);
+                    int masterPort = ((Long) masterInfo.get(1)).intValue();
+                    for (int i = 0; i < clients.size(); i++) {
+                        if (jedisSeedAddresses.get(i).getPort() == masterPort) {
+                            return i;
+                        }
+                    }
+                    throw new IllegalStateException("No primary found for port " + masterPort);
+                }
+            }
+        }
+        throw new IllegalStateException("No primary found for slot " + slot);
+    }
+
+    public void migrateSlotAndKey(String key, int sourceIndex, int targetIndex)
+    {
+        int slot = getKeySlot(key);
+        String sourceNodeId = getNodeId(sourceIndex);
+        String targetNodeId = getNodeId(targetIndex);
+        int targetPort = getPort(targetIndex);
+
+        RedisClient sourceClient = clients.get(sourceIndex);
+
+        // Mark slot as migrating on source and importing on target
+        try (Connection connection = sourceClient.getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "MIGRATING", targetNodeId);
+            connection.getStatusCodeReply();
+        }
+        try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "IMPORTING", sourceNodeId);
+            connection.getStatusCodeReply();
+        }
+
+        // Move the actual key using DUMP / RESTORE / DEL
+        byte[] valueBytes;
+        long ttlMillis;
+        try (Connection connection = sourceClient.getPool().getResource()) {
+            connection.sendCommand(new CommandArguments(Protocol.Command.DUMP).add(key));
+            Object reply = connection.getOne();
+            valueBytes = (byte[]) reply;
+
+            connection.sendCommand(Protocol.Command.PTTL, key);
+            Object pttl = connection.getOne();
+            ttlMillis = pttl == null ? -1 : ((Long) pttl);
+        }
+
+        if (valueBytes != null) {
+            try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+                connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
+                        .add(key)
+                        .add(ttlMillis == -1 ? 0L : ttlMillis)
+                        .add(valueBytes));
+                connection.getStatusCodeReply();
+            }
+            try (Connection connection = sourceClient.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.DEL, key);
+                connection.getIntegerReply();
+            }
+        }
+
+        // Finalize ownership on all primaries so clients get MOVED from source to target
+        for (RedisClient client : clients) {
+            try (Connection connection = client.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "NODE", targetNodeId);
+                connection.getStatusCodeReply();
+            }
+        }
+
+        waitForClusterReady();
+    }
+
+    public void prepareAskingSlot(String key, int sourceIndex, int targetIndex)
+    {
+        int slot = getKeySlot(key);
+        String sourceNodeId = getNodeId(sourceIndex);
+        String targetNodeId = getNodeId(targetIndex);
+
+        RedisClient sourceClient = clients.get(sourceIndex);
+
+        // Mark slot as migrating/importing, move key, but do not set NODE owner
+        try (Connection connection = sourceClient.getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "MIGRATING", targetNodeId);
+            connection.getStatusCodeReply();
+        }
+        try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "IMPORTING", sourceNodeId);
+            connection.getStatusCodeReply();
+        }
+
+        // Move the actual key without finalizing, leaving slot in ASK state
+        byte[] valueBytes;
+        long ttlMillis;
+        try (Connection connection = sourceClient.getPool().getResource()) {
+            connection.sendCommand(new CommandArguments(Protocol.Command.DUMP).add(key));
+            Object reply = connection.getOne();
+            valueBytes = (byte[]) reply;
+
+            connection.sendCommand(Protocol.Command.PTTL, key);
+            Object pttl = connection.getOne();
+            ttlMillis = pttl == null ? -1 : ((Long) pttl);
+        }
+
+        if (valueBytes != null) {
+            try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+                connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
+                        .add(key)
+                        .add(ttlMillis == -1 ? 0L : ttlMillis)
+                        .add(valueBytes));
+                connection.getStatusCodeReply();
+            }
+            try (Connection connection = sourceClient.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.DEL, key);
+                connection.getIntegerReply();
+            }
+        }
+
+        // Slot remains in MIGRATING/IMPORTING state; source returns ASK target.
+        // cluster_state is fail because the slot has no owner, so we wait briefly
+        // for the cluster bus to propagate the importing/migrating state.
+        try {
+            Thread.sleep(500);
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for ASK slot state", e);
+        }
+    }
+
+    private String getNodeId(int primaryIndex)
+    {
+        try (Connection connection = clients.get(primaryIndex).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.CLUSTER, "NODES");
+            String info = SafeEncoder.encode((byte[]) connection.getOne());
+            for (String line : info.split("\n")) {
+                String[] parts = line.trim().split("\\s+");
+                if (parts.length >= 3 && parts[2].contains("myself")) {
+                    return parts[0];
+                }
+            }
+            throw new IllegalStateException("Could not find node id for primary " + primaryIndex + " in CLUSTER NODES output");
+        }
     }
 
     @Override

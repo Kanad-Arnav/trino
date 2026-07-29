@@ -526,7 +526,19 @@ public class RedisRecordCursor
                             results[originalIndex] = value;
                         }
                         catch (JedisDataException retryException) {
-                            if (isRedirectionError(retryException)) {
+                            if (RedisClientManager.isAskRedirection(retryException)) {
+                                // MOVED target returned ASK — slot is migrating, follow ASK
+                                HostAddress askTarget = RedisClientManager.parseRedirectionTarget(retryException);
+                                if (askTarget != null) {
+                                    results[originalIndex] = clientManager.askAndGet(askTarget, key);
+                                }
+                                else {
+                                    throw new TrinoException(
+                                            GENERIC_INTERNAL_ERROR,
+                                            "Malformed ASK redirection from MOVED target for key " + key + ": " + retryException.getMessage());
+                                }
+                            }
+                            else if (isRedirectionError(retryException)) {
                                 // Still redirected after retry — queue for next attempt
                                 nextPendingIndices.add(originalIndex);
                                 nextPendingKeys.add(key);
@@ -632,7 +644,19 @@ public class RedisRecordCursor
                             results[originalIndex] = value;
                         }
                         catch (JedisDataException retryException) {
-                            if (isRedirectionError(retryException)) {
+                            if (RedisClientManager.isAskRedirection(retryException)) {
+                                // MOVED target returned ASK — slot is migrating, follow ASK
+                                HostAddress askTarget = RedisClientManager.parseRedirectionTarget(retryException);
+                                if (askTarget != null) {
+                                    results[originalIndex] = clientManager.askAndGetAll(askTarget, key);
+                                }
+                                else {
+                                    throw new TrinoException(
+                                            GENERIC_INTERNAL_ERROR,
+                                            "Malformed ASK redirection from MOVED target for hash key " + key + ": " + retryException.getMessage());
+                                }
+                            }
+                            else if (isRedirectionError(retryException)) {
                                 nextPendingIndices.add(originalIndex);
                                 nextPendingKeys.add(key);
                             }

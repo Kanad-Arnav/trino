@@ -33,25 +33,27 @@ import java.util.Set;
 import static com.google.common.base.Preconditions.checkState;
 
 /**
- * Manages a real multi-primary Redis Cluster using Docker containers for testing.
+ * Manages a real multi-primary Redis Cluster using a single Docker container
+ * running multiple Redis instances on different ports.
  * <p>
- * Starts {@code numPrimaries} Redis instances with cluster mode enabled, forms them
- * into a cluster by distributing hash slots evenly, and provides seed addresses
- * and a {@link JedisCluster} client for cluster-aware data loading.
+ * Starts {@code numPrimaries} Redis instances with cluster mode enabled within
+ * one container, forms them into a cluster by distributing hash slots evenly,
+ * and provides seed addresses and a {@link RedisClusterClient} for cluster-aware
+ * data loading.
  * <p>
- * Each container binds a fixed host port (starting at {@code basePort}) so that
- * {@code cluster-announce-ip} and {@code cluster-announce-port} can be set to
- * reachable addresses from the test JVM.
+ * Using a single container avoids cross-container networking issues: all Redis
+ * instances share the same network namespace and can reach each other via
+ * {@code 127.0.0.1}. Fixed port bindings (7000, 7001, ...) make the advertised
+ * addresses reachable from the test JVM as well.
  */
 public class RedisCluster
         implements Closeable
 {
-    private static final int REDIS_PORT = 6379;
     private static final int DEFAULT_NUM_PRIMARIES = 3;
     private static final int DEFAULT_BASE_PORT = 7000;
     private static final int CLUSTER_TIMEOUT_MILLIS = 5000;
 
-    private final List<GenericContainer<?>> containers;
+    private final GenericContainer<?> container;
     private final List<RedisClient> clients;
     private final List<HostAndPort> jedisSeedAddresses;
     private final List<com.google.common.net.HostAndPort> seedAddresses;
@@ -64,42 +66,57 @@ public class RedisCluster
 
     public RedisCluster(int numPrimaries, int basePort)
     {
-        containers = new ArrayList<>(numPrimaries);
         clients = new ArrayList<>(numPrimaries);
         jedisSeedAddresses = new ArrayList<>(numPrimaries);
         seedAddresses = new ArrayList<>(numPrimaries);
 
-        // Start all containers with fixed port bindings
+        // Build the command to start all Redis instances in a single container
+        StringBuilder command = new StringBuilder();
+        List<Integer> ports = new ArrayList<>(numPrimaries);
         for (int i = 0; i < numPrimaries; i++) {
-            int hostPort = basePort + i;
-            GenericContainer<?> container = new GenericContainer<>("redis:" + RedisServer.LATEST_VERSION)
-                    .withExposedPorts(REDIS_PORT)
-                    .withCommand("redis-server",
-                            "--cluster-enabled", "yes",
-                            "--cluster-config-file", "nodes.conf",
-                            "--cluster-node-timeout", Integer.toString(CLUSTER_TIMEOUT_MILLIS),
-                            "--appendonly", "yes");
-            // Fixed port binding so cluster-announce-port is reachable from the test JVM
-            container.setPortBindings(ImmutableList.of(hostPort + ":" + REDIS_PORT));
-            container.start();
-            containers.add(container);
+            int port = basePort + i;
+            ports.add(port);
+            if (i > 0) {
+                command.append(" & ");
+            }
+            command.append("redis-server")
+                    .append(" --port ").append(port)
+                    .append(" --cluster-enabled yes")
+                    .append(" --cluster-config-file nodes").append(i).append(".conf")
+                    .append(" --cluster-node-timeout ").append(CLUSTER_TIMEOUT_MILLIS)
+                    .append(" --appendonly yes");
+        }
+        command.append(" & wait");
 
-            // Set cluster-announce-ip and cluster-announce-port before forming the cluster
-            String announceIp = "127.0.0.1";
+        // Expose all ports with fixed bindings so cluster-announce-port is reachable from the test JVM
+        ImmutableList.Builder<String> portBindings = ImmutableList.builder();
+        for (int port : ports) {
+            portBindings.add(port + ":" + port);
+        }
+
+        container = new GenericContainer<>("redis:" + RedisServer.LATEST_VERSION)
+                .withExposedPorts(ports.toArray(new Integer[0]))
+                .withCommand("/bin/sh", "-c", command.toString());
+        container.setPortBindings(portBindings.build());
+        container.start();
+
+        // Create clients for each Redis instance and set cluster-announce-ip/port
+        String announceIp = "127.0.0.1";
+        for (int i = 0; i < numPrimaries; i++) {
+            int port = ports.get(i);
             RedisClient client = RedisClient.builder()
-                    .hostAndPort(container.getHost(), container.getMappedPort(REDIS_PORT))
+                    .hostAndPort(announceIp, port)
                     .clientConfig(DefaultJedisClientConfig.builder().build())
                     .build();
             try (Connection connection = client.getPool().getResource()) {
                 connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-ip", announceIp);
                 connection.getStatusCodeReply();
-                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-port", Integer.toString(hostPort));
+                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-port", Integer.toString(port));
                 connection.getStatusCodeReply();
             }
             clients.add(client);
-
-            jedisSeedAddresses.add(new HostAndPort(announceIp, hostPort));
-            seedAddresses.add(com.google.common.net.HostAndPort.fromParts(announceIp, hostPort));
+            jedisSeedAddresses.add(new HostAndPort(announceIp, port));
+            seedAddresses.add(com.google.common.net.HostAndPort.fromParts(announceIp, port));
         }
 
         // Form the cluster: MEET all nodes, then distribute slots
@@ -222,9 +239,6 @@ public class RedisCluster
         return clients.get(0);
     }
 
-    /**
-     * Closes the JedisCluster and all Redis clients and containers.
-     */
     @Override
     public void close()
     {
@@ -242,13 +256,11 @@ public class RedisCluster
                 // ignore
             }
         }
-        for (GenericContainer<?> container : containers) {
-            try {
-                container.close();
-            }
-            catch (Exception e) {
-                // ignore
-            }
+        try {
+            container.close();
+        }
+        catch (Exception e) {
+            // ignore
         }
     }
 }

@@ -82,5 +82,8 @@ final class TestRedisClusterRedirectRetry
 
         // The connector must send ASKING to the target and still return the value
         assertThat(query(query)).matches("VALUES CAST('ALGERIA' AS VARCHAR(25))");
+
+        // Restore a stable slot owner so the shared cluster is not left mid-migration
+        redisCluster.migrateSlotAndKey(key, sourceIndex, targetIndex);
     }
 }

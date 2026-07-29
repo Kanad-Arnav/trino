@@ -466,7 +466,6 @@ public class RedisCluster
         String targetNodeId = getNodeId(targetIndex);
         RedisClient sourceClient = clients.get(sourceIndex);
         RedisClient targetClient = clients.get(targetIndex);
-        int targetPort = getPort(targetIndex);
 
         try (Connection connection = sourceClient.getPool().getResource()) {
             connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "MIGRATING", targetNodeId);

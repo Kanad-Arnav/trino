@@ -397,6 +397,7 @@ public class RedisCluster
         String targetNodeId = getNodeId(targetIndex);
 
         RedisClient sourceClient = clients.get(sourceIndex);
+        int targetPort = getPort(targetIndex);
 
         // Mark slot as migrating on source and importing on target
         try (Connection connection = sourceClient.getPool().getResource()) {
@@ -408,44 +409,10 @@ public class RedisCluster
             connection.getStatusCodeReply();
         }
 
-        // Move the actual key using DUMP / PTTL / RESTORE / DEL from the test JVM.
-        // We cannot use the server-side MIGRATE command in Docker, because the
-        // source container would try to reach 127.0.0.1:targetPort and connect to
-        // itself instead of the target container.
-        byte[] valueBytes;
-        long ttlMillis;
+        // Move the actual key using MIGRATE (handles ASKING/RESTORE/DEL/TTL internally)
         try (Connection connection = sourceClient.getPool().getResource()) {
-            connection.sendCommand(new CommandArguments(Protocol.Command.DUMP).add(key));
-            Object reply = connection.getOne();
-            valueBytes = (byte[]) reply;
-
-            if (valueBytes != null) {
-                connection.sendCommand(Protocol.Command.PTTL, key);
-                Object pttl = connection.getOne();
-                ttlMillis = pttl == null ? -1 : ((Long) pttl);
-            }
-            else {
-                ttlMillis = -1;
-            }
-        }
-
-        if (valueBytes != null) {
-            try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
-                // ASKING allows the importing target to accept the next command
-                // for a slot it does not yet own.
-                connection.sendCommand(Protocol.Command.ASKING);
-                connection.getStatusCodeReply();
-                connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
-                        .add(key)
-                        .add(ttlMillis == -1 ? 0L : ttlMillis)
-                        .add(valueBytes)
-                        .add("REPLACE"));
-                connection.getStatusCodeReply();
-            }
-            try (Connection connection = sourceClient.getPool().getResource()) {
-                connection.sendCommand(Protocol.Command.DEL, key);
-                connection.getIntegerReply();
-            }
+            connection.sendCommand(Protocol.Command.MIGRATE, "127.0.0.1", Integer.toString(targetPort), key, "0", "5000", "REPLACE");
+            connection.getStatusCodeReply();
         }
 
         // Finalize ownership on all primaries so clients get MOVED from source to target
@@ -466,6 +433,7 @@ public class RedisCluster
         String targetNodeId = getNodeId(targetIndex);
         RedisClient sourceClient = clients.get(sourceIndex);
         RedisClient targetClient = clients.get(targetIndex);
+        int targetPort = getPort(targetIndex);
 
         try (Connection connection = sourceClient.getPool().getResource()) {
             connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "MIGRATING", targetNodeId);
@@ -476,7 +444,7 @@ public class RedisCluster
             connection.getStatusCodeReply();
         }
 
-        // Move all keys in the slot using DUMP/PTTL/RESTORE/DEL from the test JVM.
+        // Move all keys in the slot using MIGRATE (handles ASKING/RESTORE/DEL/TTL).
         // CLUSTER GETKEYSINSLOT has no cursor, so we delete each batch and call
         // again until the slot is empty.
         while (true) {
@@ -484,39 +452,18 @@ public class RedisCluster
             if (keys.isEmpty()) {
                 break;
             }
-            for (String key : keys) {
-                byte[] valueBytes;
-                long ttlMillis;
-                try (Connection connection = sourceClient.getPool().getResource()) {
-                    connection.sendCommand(new CommandArguments(Protocol.Command.DUMP).add(key));
-                    Object reply = connection.getOne();
-                    valueBytes = (byte[]) reply;
-
-                    if (valueBytes != null) {
-                        connection.sendCommand(Protocol.Command.PTTL, key);
-                        Object pttl = connection.getOne();
-                        ttlMillis = pttl == null ? -1 : ((Long) pttl);
-                    }
-                    else {
-                        ttlMillis = -1;
-                    }
-                }
-                if (valueBytes != null) {
-                    try (Connection connection = targetClient.getPool().getResource()) {
-                        connection.sendCommand(Protocol.Command.ASKING);
-                        connection.getStatusCodeReply();
-                        connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
-                                .add(key)
-                                .add(ttlMillis == -1 ? 0L : ttlMillis)
-                                .add(valueBytes)
-                                .add("REPLACE"));
-                        connection.getStatusCodeReply();
-                    }
-                    try (Connection connection = sourceClient.getPool().getResource()) {
-                        connection.sendCommand(Protocol.Command.DEL, key);
-                        connection.getIntegerReply();
-                    }
-                }
+            List<String> migrateArgs = new ArrayList<>();
+            migrateArgs.add("127.0.0.1");
+            migrateArgs.add(Integer.toString(targetPort));
+            migrateArgs.add("");
+            migrateArgs.add("0");
+            migrateArgs.add("5000");
+            migrateArgs.add("REPLACE");
+            migrateArgs.add("KEYS");
+            migrateArgs.addAll(keys);
+            try (Connection connection = sourceClient.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.MIGRATE, migrateArgs.toArray(new String[0]));
+                connection.getStatusCodeReply();
             }
         }
 
@@ -560,6 +507,7 @@ public class RedisCluster
         String targetNodeId = getNodeId(targetIndex);
 
         RedisClient sourceClient = clients.get(sourceIndex);
+        int targetPort = getPort(targetIndex);
 
         // Mark slot as migrating/importing, move key, but do not set NODE owner
         try (Connection connection = sourceClient.getPool().getResource()) {
@@ -572,42 +520,10 @@ public class RedisCluster
         }
 
         // Move the actual key without finalizing, leaving slot in ASK state.
-        // Use DUMP/PTTL/RESTORE/DEL from the test JVM; server-side MIGRATE does
-        // not work in Docker because the source container cannot reach the target
-        // via 127.0.0.1.
-        byte[] valueBytes;
-        long ttlMillis;
+        // MIGRATE handles ASKING/RESTORE/DEL/TTL internally.
         try (Connection connection = sourceClient.getPool().getResource()) {
-            connection.sendCommand(new CommandArguments(Protocol.Command.DUMP).add(key));
-            Object reply = connection.getOne();
-            valueBytes = (byte[]) reply;
-
-            if (valueBytes != null) {
-                connection.sendCommand(Protocol.Command.PTTL, key);
-                Object pttl = connection.getOne();
-                ttlMillis = pttl == null ? -1 : ((Long) pttl);
-            }
-            else {
-                ttlMillis = -1;
-            }
-        }
-
-        if (valueBytes != null) {
-            try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
-                // ASKING allows the importing target to accept the next command
-                // for a slot it does not yet own.
-                connection.sendCommand(Protocol.Command.ASKING);
-                connection.getStatusCodeReply();
-                connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
-                        .add(key)
-                        .add(ttlMillis == -1 ? 0L : ttlMillis)
-                        .add(valueBytes));
-                connection.getStatusCodeReply();
-            }
-            try (Connection connection = sourceClient.getPool().getResource()) {
-                connection.sendCommand(Protocol.Command.DEL, key);
-                connection.getIntegerReply();
-            }
+            connection.sendCommand(Protocol.Command.MIGRATE, "127.0.0.1", Integer.toString(targetPort), key, "0", "5000", "REPLACE");
+            connection.getStatusCodeReply();
         }
 
         // Slot remains in MIGRATING/IMPORTING state; source returns ASK target.

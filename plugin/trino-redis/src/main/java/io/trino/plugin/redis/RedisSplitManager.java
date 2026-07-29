@@ -97,6 +97,10 @@ public class RedisSplitManager
                                 + "A ZSET key resides on a single cluster node and cannot be split across shards.");
             }
 
+            // Refresh the topology so we don't create splits for a failed primary.
+            // This is especially important after a failover, when a promoted replica
+            // has taken over the failed primary's slots.
+            clientManager.refreshTopology();
             RedisClusterTopology topology = clientManager.getClusterTopology();
 
             // Check for pushed-down key predicates (=, IN) that can be routed by slot

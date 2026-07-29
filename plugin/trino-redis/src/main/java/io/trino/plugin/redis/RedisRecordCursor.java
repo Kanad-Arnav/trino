@@ -42,6 +42,7 @@ import redis.clients.jedis.resps.ScanResult;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -453,6 +454,12 @@ public class RedisRecordCursor
      * primary-failover handling.  When the split's primary becomes unreachable,
      * the topology is refreshed and keys are resolved to the new primary.
      */
+    private static List<String> toList(String[] results)
+    {
+        // List.of rejects null elements, but Redis GET may legitimately return null.
+        return new ArrayList<>(Arrays.asList(results));
+    }
+
     private List<String> fetchStringValuesCluster(List<String> currentKeys)
     {
         String[] results = new String[currentKeys.size()];
@@ -553,7 +560,7 @@ public class RedisRecordCursor
                     "Exhausted " + MAX_REDIRECTION_RETRIES + " retries for cluster redirection(s) on keys: " + pendingKeys);
         }
 
-        return new ArrayList<>(List.of(results));
+        return toList(results);
     }
 
     /**
@@ -657,7 +664,7 @@ public class RedisRecordCursor
                     "Exhausted " + MAX_REDIRECTION_RETRIES + " retries for cluster redirection(s) on hash keys: " + pendingKeys);
         }
 
-        return new ArrayList<>(List.of(results));
+        return new ArrayList<>(Arrays.asList(results));
     }
 
     private List<String> resolveKeysAfterConnectionFailure(

@@ -28,7 +28,6 @@ import redis.clients.jedis.util.SafeEncoder;
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 
 import static com.google.common.base.Preconditions.checkState;
 
@@ -149,8 +148,11 @@ public class RedisCluster
             if (slotsForThisNode > 0) {
                 int endSlot = currentSlot + slotsForThisNode - 1;
                 try (Connection connection = clients.get(i).getPool().getResource()) {
-                    connection.sendCommand(Protocol.Command.CLUSTER, "ADDSLOTSRANGE",
-                            Integer.toString(currentSlot), Integer.toString(endSlot));
+                    connection.sendCommand(
+                            Protocol.Command.CLUSTER,
+                            "ADDSLOTSRANGE",
+                            Integer.toString(currentSlot),
+                            Integer.toString(endSlot));
                     connection.getStatusCodeReply();
                 }
                 currentSlot = endSlot + 1;
@@ -203,7 +205,9 @@ public class RedisCluster
                 assignedSlots += (endSlot - startSlot + 1);
             }
             checkState(assignedSlots == RedisClusterTopology.TOTAL_SLOTS,
-                    "Cluster has %d assigned slots, expected %d", assignedSlots, RedisClusterTopology.TOTAL_SLOTS);
+                    "Cluster has %d assigned slots, expected %d",
+                    assignedSlots,
+                    RedisClusterTopology.TOTAL_SLOTS);
         }
     }
 

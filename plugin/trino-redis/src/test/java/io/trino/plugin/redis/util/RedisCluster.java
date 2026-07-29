@@ -56,11 +56,11 @@ public class RedisCluster
     // RedisCluster uses fixed host port bindings, so only one cluster can be active at a time.
     private static final Semaphore CLUSTER_SEMAPHORE = new Semaphore(1);
 
-    private final GenericContainer<?> container;
+    private GenericContainer<?> container;
     private final List<RedisClient> clients;
     private final List<HostAndPort> jedisSeedAddresses;
     private final List<com.google.common.net.HostAndPort> seedAddresses;
-    private final RedisClusterClient redisClusterClient;
+    private RedisClusterClient redisClusterClient;
 
     public RedisCluster()
     {

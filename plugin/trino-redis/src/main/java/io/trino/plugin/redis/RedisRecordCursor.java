@@ -454,7 +454,7 @@ public class RedisRecordCursor
      * primary-failover handling.  When the split's primary becomes unreachable,
      * the topology is refreshed and keys are resolved to the new primary.
      */
-    private static List<String> toList(String[] results)
+    private static List<String> toArrayList(String[] results)
     {
         // List.of rejects null elements, but Redis GET may legitimately return null.
         return new ArrayList<>(Arrays.asList(results));
@@ -560,7 +560,7 @@ public class RedisRecordCursor
                     "Exhausted " + MAX_REDIRECTION_RETRIES + " retries for cluster redirection(s) on keys: " + pendingKeys);
         }
 
-        return toList(results);
+        return toArrayList(results);
     }
 
     /**

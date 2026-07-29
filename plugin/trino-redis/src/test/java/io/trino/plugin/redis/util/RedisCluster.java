@@ -15,6 +15,7 @@ package io.trino.plugin.redis.util;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import io.airlift.log.Logger;
 import io.trino.plugin.redis.RedisClusterTopology;
 import org.testcontainers.containers.GenericContainer;
 import redis.clients.jedis.CommandArguments;
@@ -50,7 +51,10 @@ import static com.google.common.base.Preconditions.checkState;
 public class RedisCluster
         implements Closeable
 {
+    private static final Logger log = Logger.get(RedisCluster.class);
+
     private static final int DEFAULT_NUM_PRIMARIES = 3;
+    private static final int DEFAULT_NUM_REPLICAS = 0;
     private static final int DEFAULT_BASE_PORT = 7000;
     private static final int CLUSTER_TIMEOUT_MILLIS = 5000;
 
@@ -59,18 +63,25 @@ public class RedisCluster
 
     private GenericContainer<?> container;
     private final List<RedisClient> clients;
+    private final List<RedisClient> replicaClients;
     private final List<HostAndPort> jedisSeedAddresses;
     private final List<com.google.common.net.HostAndPort> seedAddresses;
     private RedisClusterClient redisClusterClient;
 
     public RedisCluster()
     {
-        this(DEFAULT_NUM_PRIMARIES, DEFAULT_BASE_PORT);
+        this(DEFAULT_NUM_PRIMARIES, DEFAULT_BASE_PORT, DEFAULT_NUM_REPLICAS);
     }
 
     public RedisCluster(int numPrimaries, int basePort)
     {
+        this(numPrimaries, basePort, DEFAULT_NUM_REPLICAS);
+    }
+
+    public RedisCluster(int numPrimaries, int basePort, int numReplicas)
+    {
         clients = new ArrayList<>(numPrimaries);
+        replicaClients = new ArrayList<>(numReplicas);
         jedisSeedAddresses = new ArrayList<>(numPrimaries);
         seedAddresses = new ArrayList<>(numPrimaries);
 
@@ -79,7 +90,7 @@ public class RedisCluster
         boolean acquired = true;
 
         try {
-            startCluster(numPrimaries, basePort);
+            startCluster(numPrimaries, basePort, numReplicas);
             acquired = false;
         }
         finally {
@@ -89,24 +100,32 @@ public class RedisCluster
         }
     }
 
-    private void startCluster(int numPrimaries, int basePort)
+    private void startCluster(int numPrimaries, int basePort, int numReplicas)
     {
         // Build the command to start all Redis instances in a single container.
         // Each instance gets its own data directory to avoid AOF/cluster-config file conflicts.
-        List<Integer> ports = new ArrayList<>(numPrimaries);
+        List<Integer> primaryPorts = new ArrayList<>(numPrimaries);
         for (int i = 0; i < numPrimaries; i++) {
-            ports.add(basePort + i);
+            primaryPorts.add(basePort + i);
         }
+
+        List<Integer> replicaPorts = new ArrayList<>(numReplicas);
+        for (int i = 0; i < numReplicas; i++) {
+            replicaPorts.add(basePort + numPrimaries + i);
+        }
+
+        List<Integer> allPorts = new ArrayList<>(primaryPorts);
+        allPorts.addAll(replicaPorts);
 
         StringBuilder command = new StringBuilder();
         command.append("mkdir -p");
-        for (int i = 0; i < numPrimaries; i++) {
+        for (int i = 0; i < allPorts.size(); i++) {
             command.append(" /data/").append(i);
         }
         command.append("; ");
 
-        for (int i = 0; i < numPrimaries; i++) {
-            int port = ports.get(i);
+        for (int i = 0; i < allPorts.size(); i++) {
+            int port = allPorts.get(i);
             command.append("redis-server")
                     .append(" --port ").append(port)
                     .append(" --cluster-enabled yes")
@@ -120,12 +139,12 @@ public class RedisCluster
 
         // Expose all ports with fixed bindings so cluster-announce-port is reachable from the test JVM
         ImmutableList.Builder<String> portBindings = ImmutableList.builder();
-        for (int port : ports) {
+        for (int port : allPorts) {
             portBindings.add(port + ":" + port);
         }
 
         container = new GenericContainer<>("redis:" + RedisServer.LATEST_VERSION)
-                .withExposedPorts(ports.toArray(new Integer[0]))
+                .withExposedPorts(allPorts.toArray(new Integer[0]))
                 .withCommand("/bin/sh", "-c", command.toString());
         container.setPortBindings(portBindings.build());
         container.start();
@@ -133,7 +152,7 @@ public class RedisCluster
         // Create clients for each Redis instance and set cluster-announce-ip/port
         String announceIp = "127.0.0.1";
         for (int i = 0; i < numPrimaries; i++) {
-            int port = ports.get(i);
+            int port = primaryPorts.get(i);
             RedisClient client = RedisClient.builder()
                     .hostAndPort(announceIp, port)
                     .clientConfig(DefaultJedisClientConfig.builder().build())
@@ -149,22 +168,45 @@ public class RedisCluster
             seedAddresses.add(com.google.common.net.HostAndPort.fromParts(announceIp, port));
         }
 
-        // Form the cluster: MEET all nodes, then distribute slots
-        formCluster(ports);
+        for (int i = 0; i < numReplicas; i++) {
+            int port = replicaPorts.get(i);
+            RedisClient client = RedisClient.builder()
+                    .hostAndPort(announceIp, port)
+                    .clientConfig(DefaultJedisClientConfig.builder().build())
+                    .build();
+            try (Connection connection = client.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-ip", announceIp);
+                connection.getStatusCodeReply();
+                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-port", Integer.toString(port));
+                connection.getStatusCodeReply();
+            }
+            replicaClients.add(client);
+        }
+
+        // Form the cluster: MEET all nodes, distribute slots, and attach replicas
+        formCluster(primaryPorts, replicaPorts);
 
         // Create RedisClusterClient for cluster-aware data loading
         redisClusterClient = RedisClusterClient.create(ImmutableSet.copyOf(jedisSeedAddresses));
     }
 
-    private void formCluster(List<Integer> ports)
+    private void formCluster(List<Integer> primaryPorts, List<Integer> replicaPorts)
     {
-        int numPrimaries = ports.size();
+        int numPrimaries = primaryPorts.size();
 
-        // Meet all nodes from the first node
+        // Meet all primary nodes from the first primary
         RedisClient firstClient = clients.get(0);
         for (int i = 1; i < numPrimaries; i++) {
             try (Connection connection = firstClient.getPool().getResource()) {
-                connection.sendCommand(Protocol.Command.CLUSTER, "MEET", "127.0.0.1", Integer.toString(ports.get(i)));
+                connection.sendCommand(Protocol.Command.CLUSTER, "MEET", "127.0.0.1", Integer.toString(primaryPorts.get(i)));
+                connection.getStatusCodeReply();
+            }
+        }
+
+        // Meet replica nodes from the first primary so they join the cluster
+        for (int port : replicaPorts) {
+            try (Connection connection = firstClient.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.CLUSTER, "MEET", "127.0.0.1", Integer.toString(port));
                 connection.getStatusCodeReply();
             }
         }
@@ -194,6 +236,11 @@ public class RedisCluster
 
         // Verify all slots are assigned
         verifyClusterState();
+
+        // Attach replicas to primaries if any were requested
+        if (!replicaClients.isEmpty()) {
+            assignReplicas();
+        }
     }
 
     private void waitForClusterReady()
@@ -457,9 +504,59 @@ public class RedisCluster
         }
     }
 
+    private void assignReplicas()
+    {
+        for (int i = 0; i < replicaClients.size(); i++) {
+            int primaryIndex = i % clients.size();
+            String primaryNodeId = getNodeId(clients.get(primaryIndex));
+            try (Connection connection = replicaClients.get(i).getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.CLUSTER, "REPLICATE", primaryNodeId);
+                connection.getStatusCodeReply();
+            }
+        }
+
+        long deadlineMillis = System.currentTimeMillis() + 60_000;
+        while (System.currentTimeMillis() < deadlineMillis) {
+            boolean allConnected = true;
+            for (int i = 0; i < replicaClients.size(); i++) {
+                int primaryIndex = i % clients.size();
+                String primaryNodeId = getNodeId(clients.get(primaryIndex));
+                String expectedLine = "slave " + primaryNodeId;
+                try (Connection connection = replicaClients.get(i).getPool().getResource()) {
+                    connection.sendCommand(Protocol.Command.CLUSTER, "NODES");
+                    String info = SafeEncoder.encode((byte[]) connection.getOne());
+                    if (!info.contains("myself,slave") || !info.contains(expectedLine) || !info.contains("connected")) {
+                        allConnected = false;
+                        break;
+                    }
+                }
+                catch (Exception e) {
+                    allConnected = false;
+                    break;
+                }
+            }
+            if (allConnected) {
+                return;
+            }
+            try {
+                Thread.sleep(500);
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted while waiting for replicas to connect", e);
+            }
+        }
+        throw new IllegalStateException("Replicas did not become connected within 60 seconds");
+    }
+
     private String getNodeId(int primaryIndex)
     {
-        try (Connection connection = clients.get(primaryIndex).getPool().getResource()) {
+        return getNodeId(clients.get(primaryIndex));
+    }
+
+    private String getNodeId(RedisClient client)
+    {
+        try (Connection connection = client.getPool().getResource()) {
             connection.sendCommand(Protocol.Command.CLUSTER, "NODES");
             String info = SafeEncoder.encode((byte[]) connection.getOne());
             for (String line : info.split("\n")) {
@@ -468,8 +565,62 @@ public class RedisCluster
                     return parts[0];
                 }
             }
-            throw new IllegalStateException("Could not find node id for primary " + primaryIndex + " in CLUSTER NODES output");
+            throw new IllegalStateException("Could not find node id in CLUSTER NODES output");
         }
+    }
+
+    /**
+     * Stops the primary at the given index and waits for its replica to be promoted.
+     * Returns the index of the new primary (the replica's former index).
+     */
+    public int killPrimaryAndWaitForFailover(int primaryIndex)
+    {
+        checkState(!replicaClients.isEmpty(), "No replicas configured, cannot fail over");
+        checkState(primaryIndex < clients.size() && primaryIndex < replicaClients.size(),
+                "Primary %s has no configured replica", primaryIndex);
+
+        RedisClient primary = clients.get(primaryIndex);
+        RedisClient replica = replicaClients.get(primaryIndex);
+
+        // Shut down the primary so the cluster marks it as fail
+        try (Connection connection = primary.getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.SHUTDOWN, "NOSAVE");
+        }
+        catch (Exception e) {
+            // SHUTDOWN closes the connection, so an exception is expected
+            log.info("Sent SHUTDOWN to primary %s", primaryIndex);
+        }
+
+        primary.close();
+
+        // Wait for the replica to be promoted to master
+        String replicaNodeId = getNodeId(replica);
+        long deadlineMillis = System.currentTimeMillis() + 60_000;
+        while (System.currentTimeMillis() < deadlineMillis) {
+            try (Connection connection = replica.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.CLUSTER, "NODES");
+                String info = SafeEncoder.encode((byte[]) connection.getOne());
+                if (info.contains(replicaNodeId) && info.contains("myself,master") && info.contains("connected")) {
+                    break;
+                }
+            }
+            catch (Exception e) {
+                // replica may still be starting up; keep waiting
+            }
+            try {
+                Thread.sleep(500);
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted while waiting for failover", e);
+            }
+        }
+
+        waitForClusterReady();
+
+        // Promoted replica is now a primary; keep a stable client for it
+        clients.set(primaryIndex, replica);
+        return primaryIndex;
     }
 
     @Override
@@ -482,6 +633,14 @@ public class RedisCluster
             // ignore
         }
         for (RedisClient client : clients) {
+            try {
+                client.close();
+            }
+            catch (Exception e) {
+                // ignore
+            }
+        }
+        for (RedisClient client : replicaClients) {
             try {
                 client.close();
             }

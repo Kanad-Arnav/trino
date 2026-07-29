@@ -399,16 +399,6 @@ public class RedisCluster
         RedisClient sourceClient = clients.get(sourceIndex);
         int targetPort = getPort(targetIndex);
 
-        // Verify the key exists on the source before migration
-        try (Connection connection = sourceClient.getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.EXISTS, key);
-            Long exists = (Long) connection.getOne();
-            if (exists == null || exists == 0) {
-                throw new IllegalStateException(
-                        "Key " + key + " (slot " + slot + ") not found on source primary " + sourceIndex + " before MIGRATE");
-            }
-        }
-
         // Mark slot as migrating on source and importing on target
         try (Connection connection = sourceClient.getPool().getResource()) {
             connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "MIGRATING", targetNodeId);
@@ -434,15 +424,6 @@ public class RedisCluster
             connection.getStatusCodeReply();
         }
 
-        // Verify the key exists on the target after MIGRATE
-        try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.EXISTS, key);
-            Long exists = (Long) connection.getOne();
-            if (exists == null || exists == 0) {
-                throw new IllegalStateException("Key " + key + " not found on target after MIGRATE");
-            }
-        }
-
         // Finalize ownership on all primaries so clients get MOVED from source to target
         for (RedisClient client : clients) {
             try (Connection connection = client.getPool().getResource()) {
@@ -452,6 +433,15 @@ public class RedisCluster
         }
 
         waitForClusterReady();
+
+        // Verify the key exists on the target after slot finalization
+        try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.EXISTS, key);
+            Long exists = (Long) connection.getOne();
+            if (exists == null || exists == 0) {
+                throw new IllegalStateException("Key " + key + " not found on target after MIGRATE");
+            }
+        }
     }
 
     public void migrateSlot(int slot, int targetIndex)
@@ -563,8 +553,10 @@ public class RedisCluster
             connection.getStatusCodeReply();
         }
 
-        // Verify the key exists on the target after MIGRATE
+        // Verify the key exists on the target using ASKING (slot is in IMPORTING state)
         try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.ASKING);
+            connection.getStatusCodeReply();
             connection.sendCommand(Protocol.Command.EXISTS, key);
             Long exists = (Long) connection.getOne();
             if (exists == null || exists == 0) {

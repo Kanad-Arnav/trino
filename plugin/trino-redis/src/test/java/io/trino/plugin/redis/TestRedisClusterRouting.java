@@ -83,9 +83,9 @@ final class TestRedisClusterRouting
     @Test
     void testValuesAcrossShards()
     {
-        assertThat(query("SELECT name FROM nation WHERE nationkey = 0")).matches("VALUES VARCHAR 'ALGERIA'");
-        assertThat(query("SELECT name FROM nation WHERE nationkey = 1")).matches("VALUES VARCHAR 'ARGENTINA'");
-        assertThat(query("SELECT name FROM nation WHERE nationkey = 24")).matches("VALUES VARCHAR 'UNITED STATES'");
+        assertThat(query("SELECT name FROM nation WHERE nationkey = 0")).matches("VALUES CAST('ALGERIA' AS VARCHAR(25))");
+        assertThat(query("SELECT name FROM nation WHERE nationkey = 1")).matches("VALUES CAST('ARGENTINA' AS VARCHAR(25))");
+        assertThat(query("SELECT name FROM nation WHERE nationkey = 24")).matches("VALUES CAST('UNITED STATES' AS VARCHAR(25))");
     }
 
     /**
@@ -96,6 +96,6 @@ final class TestRedisClusterRouting
     {
         assertThat(query(
                 "SELECT n.name, r.name FROM nation n JOIN region r ON n.regionkey = r.regionkey WHERE n.nationkey = 0"))
-                .matches("VALUES (VARCHAR 'ALGERIA', VARCHAR 'AFRICA')");
+                .matches("VALUES (CAST('ALGERIA' AS VARCHAR(25)), CAST('AFRICA' AS VARCHAR(25)))");
     }
 }

@@ -395,7 +395,6 @@ public class RedisCluster
         int slot = getKeySlot(key);
         String sourceNodeId = getNodeId(sourceIndex);
         String targetNodeId = getNodeId(targetIndex);
-        int targetPort = getPort(targetIndex);
 
         RedisClient sourceClient = clients.get(sourceIndex);
 

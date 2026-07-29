@@ -35,6 +35,7 @@ import io.trino.spi.type.Type;
 import jakarta.annotation.Nullable;
 import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.RedisClient;
+import redis.clients.jedis.exceptions.JedisConnectionException;
 import redis.clients.jedis.exceptions.JedisDataException;
 import redis.clients.jedis.params.ScanParams;
 import redis.clients.jedis.resps.ScanResult;
@@ -448,11 +449,9 @@ public class RedisRecordCursor
     }
 
     /**
-     * Fetches string values from a cluster primary with MOVED/ASK retry.
-     * Each key is fetched individually via pipelined GET commands because scanned keys
-     * on a single primary may span multiple hash slots (but are all owned by this primary
-     * in a stable topology).  If a MOVED or ASK redirect occurs, the key is retried
-     * on the target node.  The query is failed if retries are exhausted.
+     * Fetches string values from a cluster primary with MOVED/ASK retry and
+     * primary-failover handling.  When the split's primary becomes unreachable,
+     * the topology is refreshed and keys are resolved to the new primary.
      */
     private List<String> fetchStringValuesCluster(List<String> currentKeys)
     {
@@ -466,11 +465,27 @@ public class RedisRecordCursor
 
         for (int attempt = 0; attempt < MAX_REDIRECTION_RETRIES && !pendingKeys.isEmpty(); attempt++) {
             List<Object> replies;
-            try (Pipeline pipeline = client.pipelined()) {
-                for (String key : pendingKeys) {
-                    pipeline.get(key);
+            try {
+                try (Pipeline pipeline = client.pipelined()) {
+                    for (String key : pendingKeys) {
+                        pipeline.get(key);
+                    }
+                    replies = pipeline.syncAndReturnAll();
                 }
-                replies = pipeline.syncAndReturnAll();
+            }
+            catch (JedisConnectionException e) {
+                if (!clusterEnabled) {
+                    throw e;
+                }
+                log.warn(e, "Redis cluster primary unreachable for split %s; refreshing topology", split.getNodes());
+                List<Integer> nextPendingIndices = new ArrayList<>();
+                List<String> nextPendingKeys = resolveKeysAfterConnectionFailure(pendingKeys, pendingIndices, results, RedisClient::get, nextPendingIndices);
+                if (nextPendingKeys.isEmpty()) {
+                    break;
+                }
+                pendingIndices = nextPendingIndices;
+                pendingKeys = nextPendingKeys;
+                continue;
             }
 
             List<Integer> nextPendingIndices = new ArrayList<>();
@@ -542,9 +557,8 @@ public class RedisRecordCursor
     }
 
     /**
-     * Fetches hash values from a cluster primary with MOVED/ASK retry.
-     * Each key is fetched via pipelined HGETALL.  Redirections are retried
-     * on the target node, never silently dropped.
+     * Fetches hash values from a cluster primary with MOVED/ASK retry and
+     * primary-failover handling.
      */
     private List<Object> fetchHashValuesCluster(List<String> currentKeys)
     {
@@ -558,11 +572,27 @@ public class RedisRecordCursor
 
         for (int attempt = 0; attempt < MAX_REDIRECTION_RETRIES && !pendingKeys.isEmpty(); attempt++) {
             List<Object> replies;
-            try (Pipeline pipeline = client.pipelined()) {
-                for (String key : pendingKeys) {
-                    pipeline.hgetAll(key);
+            try {
+                try (Pipeline pipeline = client.pipelined()) {
+                    for (String key : pendingKeys) {
+                        pipeline.hgetAll(key);
+                    }
+                    replies = pipeline.syncAndReturnAll();
                 }
-                replies = pipeline.syncAndReturnAll();
+            }
+            catch (JedisConnectionException e) {
+                if (!clusterEnabled) {
+                    throw e;
+                }
+                log.warn(e, "Redis cluster primary unreachable for hash split %s; refreshing topology", split.getNodes());
+                List<Integer> nextPendingIndices = new ArrayList<>();
+                List<String> nextPendingKeys = resolveKeysAfterConnectionFailure(pendingKeys, pendingIndices, results, RedisClient::hgetAll, nextPendingIndices);
+                if (nextPendingKeys.isEmpty()) {
+                    break;
+                }
+                pendingIndices = nextPendingIndices;
+                pendingKeys = nextPendingKeys;
+                continue;
             }
 
             List<Integer> nextPendingIndices = new ArrayList<>();
@@ -628,6 +658,52 @@ public class RedisRecordCursor
         }
 
         return new ArrayList<>(List.of(results));
+    }
+
+    private List<String> resolveKeysAfterConnectionFailure(
+            List<String> pendingKeys,
+            List<Integer> pendingIndices,
+            Object[] results,
+            KeyFetcher fetcher,
+            List<Integer> nextPendingIndices)
+    {
+        clientManager.refreshTopology();
+        if (split.getClusterKeysOptional().isEmpty()) {
+            throw new TrinoException(
+                    GENERIC_INTERNAL_ERROR,
+                    "Redis cluster primary became unreachable during scan");
+        }
+
+        List<String> nextPendingKeys = new ArrayList<>();
+        for (int i = 0; i < pendingKeys.size(); i++) {
+            String key = pendingKeys.get(i);
+            int originalIndex = pendingIndices.get(i);
+            try {
+                RedisClient primaryClient = clientManager.getClientForKey(key);
+                Object value = fetcher.fetch(primaryClient, key);
+                results[originalIndex] = value;
+            }
+            catch (JedisDataException dataException) {
+                if (isRedirectionError(dataException)) {
+                    nextPendingIndices.add(originalIndex);
+                    nextPendingKeys.add(key);
+                }
+                else {
+                    throw dataException;
+                }
+            }
+            catch (JedisConnectionException e) {
+                nextPendingIndices.add(originalIndex);
+                nextPendingKeys.add(key);
+            }
+        }
+        return nextPendingKeys;
+    }
+
+    @FunctionalInterface
+    private interface KeyFetcher
+    {
+        Object fetch(RedisClient client, String key);
     }
 
     private List<Object> fetchHashValuesStandalone(List<String> currentKeys)

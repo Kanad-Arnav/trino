@@ -189,22 +189,34 @@ public class RedisCluster
         }
 
         // Wait for cluster to be ready
-        waitForClusterReady(firstClient);
+        waitForClusterReady();
 
         // Verify all slots are assigned
         verifyClusterState();
     }
 
-    private void waitForClusterReady(RedisClient client)
+    private void waitForClusterReady()
     {
         long deadlineMillis = System.currentTimeMillis() + 60_000;
         while (System.currentTimeMillis() < deadlineMillis) {
-            try (Connection connection = client.getPool().getResource()) {
-                connection.sendCommand(Protocol.Command.CLUSTER, "INFO");
-                String info = SafeEncoder.encode((byte[]) connection.getOne());
-                if (info != null && info.contains("cluster_state:ok")) {
-                    return;
+            boolean allReady = true;
+            for (RedisClient client : clients) {
+                String info;
+                try (Connection connection = client.getPool().getResource()) {
+                    connection.sendCommand(Protocol.Command.CLUSTER, "INFO");
+                    info = SafeEncoder.encode((byte[]) connection.getOne());
                 }
+                catch (Exception e) {
+                    allReady = false;
+                    break;
+                }
+                if (info == null || !info.contains("cluster_state:ok")) {
+                    allReady = false;
+                    break;
+                }
+            }
+            if (allReady) {
+                return;
             }
             try {
                 Thread.sleep(500);

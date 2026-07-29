@@ -28,6 +28,7 @@ import redis.clients.jedis.util.SafeEncoder;
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Semaphore;
 
 import static com.google.common.base.Preconditions.checkState;
 
@@ -52,6 +53,9 @@ public class RedisCluster
     private static final int DEFAULT_BASE_PORT = 7000;
     private static final int CLUSTER_TIMEOUT_MILLIS = 5000;
 
+    // RedisCluster uses fixed host port bindings, so only one cluster can be active at a time.
+    private static final Semaphore CLUSTER_SEMAPHORE = new Semaphore(1);
+
     private final GenericContainer<?> container;
     private final List<RedisClient> clients;
     private final List<HostAndPort> jedisSeedAddresses;
@@ -69,6 +73,23 @@ public class RedisCluster
         jedisSeedAddresses = new ArrayList<>(numPrimaries);
         seedAddresses = new ArrayList<>(numPrimaries);
 
+        // RedisCluster binds fixed host ports; serialize so concurrent tests do not conflict.
+        CLUSTER_SEMAPHORE.acquireUninterruptibly();
+        boolean acquired = true;
+
+        try {
+            startCluster(numPrimaries, basePort);
+            acquired = false;
+        }
+        finally {
+            if (acquired) {
+                CLUSTER_SEMAPHORE.release();
+            }
+        }
+    }
+
+    private void startCluster(int numPrimaries, int basePort)
+    {
         // Build the command to start all Redis instances in a single container.
         // Each instance gets its own data directory to avoid AOF/cluster-config file conflicts.
         List<Integer> ports = new ArrayList<>(numPrimaries);
@@ -128,19 +149,21 @@ public class RedisCluster
         }
 
         // Form the cluster: MEET all nodes, then distribute slots
-        formCluster(numPrimaries);
+        formCluster(ports);
 
         // Create RedisClusterClient for cluster-aware data loading
         redisClusterClient = RedisClusterClient.create(ImmutableSet.copyOf(jedisSeedAddresses));
     }
 
-    private void formCluster(int numPrimaries)
+    private void formCluster(List<Integer> ports)
     {
+        int numPrimaries = ports.size();
+
         // Meet all nodes from the first node
         RedisClient firstClient = clients.get(0);
         for (int i = 1; i < numPrimaries; i++) {
             try (Connection connection = firstClient.getPool().getResource()) {
-                connection.sendCommand(Protocol.Command.CLUSTER, "MEET", "127.0.0.1", Integer.toString(DEFAULT_BASE_PORT + i));
+                connection.sendCommand(Protocol.Command.CLUSTER, "MEET", "127.0.0.1", Integer.toString(ports.get(i)));
                 connection.getStatusCodeReply();
             }
         }
@@ -274,6 +297,9 @@ public class RedisCluster
         }
         catch (Exception e) {
             // ignore
+        }
+        finally {
+            CLUSTER_SEMAPHORE.release();
         }
     }
 }

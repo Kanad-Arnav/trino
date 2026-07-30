@@ -436,6 +436,24 @@ public class RedisCluster
         }
     }
 
+    /**
+     * Finalizes a slot migration by assigning slot ownership to the target
+     * without moving any keys.  Use after {@link #prepareAskingSlot} to restore
+     * a stable cluster state — the key has already been moved.
+     */
+    public void finalizeSlotMigration(String key, int targetIndex)
+    {
+        int slot = getKeySlot(key);
+        String targetNodeId = getNodeId(targetIndex);
+        for (RedisClient client : clients) {
+            try (Connection connection = client.getPool().getResource()) {
+                connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "NODE", targetNodeId);
+                connection.getStatusCodeReply();
+            }
+        }
+        waitForClusterReady();
+    }
+
     private byte[] dumpKey(RedisClient client, String key)
     {
         try (Connection connection = client.getPool().getResource()) {
@@ -462,7 +480,13 @@ public class RedisCluster
         try (Connection connection = client.getPool().getResource()) {
             connection.sendCommand(Protocol.Command.ASKING);
             connection.getStatusCodeReply();
-            connection.sendCommand(Protocol.Command.RESTORE, key, Long.toString(ttlMillis), SafeEncoder.encode(dumpedValue), "REPLACE");
+            // Use CommandArguments with raw byte[] — DUMP output is binary (RDB format)
+            // and must not be round-tripped through String (UTF-8) which corrupts non-UTF-8 bytes
+            connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
+                    .add(key)
+                    .add(Long.toString(ttlMillis))
+                    .add(dumpedValue)
+                    .add("REPLACE"));
             connection.getStatusCodeReply();
         }
     }

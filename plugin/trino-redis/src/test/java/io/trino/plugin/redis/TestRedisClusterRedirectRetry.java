@@ -84,6 +84,6 @@ final class TestRedisClusterRedirectRetry
         assertThat(query(query)).matches("VALUES CAST('ALGERIA' AS VARCHAR(25))");
 
         // Restore a stable slot owner so the shared cluster is not left mid-migration
-        redisCluster.migrateSlotAndKey(key, sourceIndex, targetIndex);
+        redisCluster.finalizeSlotMigration(key, targetIndex);
     }
 }

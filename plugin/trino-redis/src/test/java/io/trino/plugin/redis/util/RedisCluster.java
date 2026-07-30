@@ -399,6 +399,8 @@ public class RedisCluster
         // DUMP and PTTL before SETSLOT — source owns the slot and serves normally
         byte[] dumpedValue = dumpKey(clients.get(sourceIndex), key);
         long ttl = pttlKey(clients.get(sourceIndex), key);
+        // PTTL returns -1 when the key has no expiration; RESTORE requires 0 for no TTL
+        long restoreTtl = ttl > 0 ? ttl : 0;
 
         // Mark slot as migrating on source and importing on target
         try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
@@ -411,7 +413,7 @@ public class RedisCluster
         }
 
         // RESTORE on target with ASKING (slot is in IMPORTING state)
-        restoreKey(clients.get(targetIndex), key, dumpedValue, ttl);
+        restoreKey(clients.get(targetIndex), key, dumpedValue, restoreTtl);
 
         // DEL on source (source is in MIGRATING state; key still exists so DEL works)
         delKey(clients.get(sourceIndex), key);
@@ -582,6 +584,8 @@ public class RedisCluster
         // DUMP and PTTL before SETSLOT — source owns the slot and serves normally
         byte[] dumpedValue = dumpKey(clients.get(sourceIndex), key);
         long ttl = pttlKey(clients.get(sourceIndex), key);
+        // PTTL returns -1 when the key has no expiration; RESTORE requires 0 for no TTL
+        long restoreTtl = ttl > 0 ? ttl : 0;
 
         // Mark slot as migrating/importing, move key, but do not set NODE owner
         try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
@@ -594,7 +598,7 @@ public class RedisCluster
         }
 
         // RESTORE on target with ASKING (slot is in IMPORTING state)
-        restoreKey(clients.get(targetIndex), key, dumpedValue, ttl);
+        restoreKey(clients.get(targetIndex), key, dumpedValue, restoreTtl);
 
         // DEL on source (source is in MIGRATING state; key still exists so DEL works)
         delKey(clients.get(sourceIndex), key);

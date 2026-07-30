@@ -140,11 +140,12 @@ public class RedisCluster
             int port = allPorts.get(i);
             command.append("redis-server");
             if (tls) {
-                command.append(" --tls-port ").append(port)
-                        .append(" --port 0")
-                        .append(" --tls-cluster yes")
-                        .append(" --cluster-port ").append(port + 10000)
-                        .append(" --cluster-announce-port ").append(port)
+                // Use a plaintext port for internal cluster bus communication and
+                // a separate TLS port for client connections.  --cluster-announce-port
+                // makes CLUSTER SLOTS return the TLS port so clients connect via TLS.
+                command.append(" --port ").append(port)
+                        .append(" --tls-port ").append(port + 1000)
+                        .append(" --cluster-announce-port ").append(port + 1000)
                         .append(" --cluster-announce-bus-port ").append(port + 10000)
                         .append(" --tls-cert-file ").append(CONTAINER_CERTS_DIR).append("redis.crt")
                         .append(" --tls-key-file ").append(CONTAINER_CERTS_DIR).append("redis.key")
@@ -166,14 +167,19 @@ public class RedisCluster
         }
         command.append("wait");
 
-        // Expose all ports with fixed bindings so cluster-announce-port is reachable from the test JVM
-        ImmutableList.Builder<String> portBindings = ImmutableList.builder();
+        // Expose client ports (TLS ports for TLS mode, plain ports otherwise) with fixed bindings
+        // so cluster-announce-port is reachable from the test JVM.
+        List<Integer> clientPorts = new ArrayList<>(allPorts.size());
         for (int port : allPorts) {
-            portBindings.add(port + ":" + port);
+            clientPorts.add(tls ? port + 1000 : port);
+        }
+        ImmutableList.Builder<String> portBindings = ImmutableList.builder();
+        for (int clientPort : clientPorts) {
+            portBindings.add(clientPort + ":" + clientPort);
         }
 
         container = new GenericContainer<>("redis:" + RedisServer.LATEST_VERSION)
-                .withExposedPorts(allPorts.toArray(new Integer[0]))
+                .withExposedPorts(clientPorts.toArray(new Integer[0]))
                 .withCommand("/bin/sh", "-c", command.toString());
         if (tls) {
             container.withCopyFileToContainer(forClasspathResource("tls/ca.crt", 0644), CONTAINER_CERTS_DIR + "ca.crt")
@@ -187,31 +193,37 @@ public class RedisCluster
         String announceIp = "127.0.0.1";
         for (int i = 0; i < numPrimaries; i++) {
             int port = primaryPorts.get(i);
+            int clientPort = tls ? port + 1000 : port;
             RedisClient client = RedisClient.builder()
-                    .hostAndPort(announceIp, port)
+                    .hostAndPort(announceIp, clientPort)
                     .clientConfig(buildClientConfig())
                     .build();
             try (Connection connection = client.getPool().getResource()) {
                 connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-ip", announceIp);
                 connection.getStatusCodeReply();
-                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-port", Integer.toString(port));
+                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-port", Integer.toString(clientPort));
+                connection.getStatusCodeReply();
+                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-bus-port", Integer.toString(port + 10000));
                 connection.getStatusCodeReply();
             }
             clients.add(client);
-            jedisSeedAddresses.add(new HostAndPort(announceIp, port));
-            seedAddresses.add(com.google.common.net.HostAndPort.fromParts(announceIp, port));
+            jedisSeedAddresses.add(new HostAndPort(announceIp, clientPort));
+            seedAddresses.add(com.google.common.net.HostAndPort.fromParts(announceIp, clientPort));
         }
 
         for (int i = 0; i < numReplicas; i++) {
             int port = replicaPorts.get(i);
+            int clientPort = tls ? port + 1000 : port;
             RedisClient client = RedisClient.builder()
-                    .hostAndPort(announceIp, port)
+                    .hostAndPort(announceIp, clientPort)
                     .clientConfig(buildClientConfig())
                     .build();
             try (Connection connection = client.getPool().getResource()) {
                 connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-ip", announceIp);
                 connection.getStatusCodeReply();
-                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-port", Integer.toString(port));
+                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-port", Integer.toString(clientPort));
+                connection.getStatusCodeReply();
+                connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-bus-port", Integer.toString(port + 10000));
                 connection.getStatusCodeReply();
             }
             replicaClients.add(client);
@@ -388,6 +400,16 @@ public class RedisCluster
         return jedisSeedAddresses.get(index).getPort();
     }
 
+    /**
+     * Returns the internal (plaintext) port of the primary at the given index,
+     * used for MIGRATE commands which connect inside the container without TLS.
+     */
+    public int getInternalPort(int index)
+    {
+        int clientPort = jedisSeedAddresses.get(index).getPort();
+        return tls ? clientPort - 1000 : clientPort;
+    }
+
     public int getKeySlot(String key)
     {
         try (Connection connection = clients.get(0).getPool().getResource()) {
@@ -432,7 +454,7 @@ public class RedisCluster
         int slot = getKeySlot(key);
         String sourceNodeId = getNodeId(sourceIndex);
         String targetNodeId = getNodeId(targetIndex);
-        int targetPort = getPort(targetIndex);
+        int targetPort = getInternalPort(targetIndex);
 
         // Mark slot as migrating on source and importing on target
         try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
@@ -495,7 +517,7 @@ public class RedisCluster
         String targetNodeId = getNodeId(targetIndex);
         RedisClient sourceClient = clients.get(sourceIndex);
         RedisClient targetClient = clients.get(targetIndex);
-        int targetPort = getPort(targetIndex);
+        int targetPort = getInternalPort(targetIndex);
 
         try (Connection connection = sourceClient.getPool().getResource()) {
             connection.sendCommand(Protocol.Command.CLUSTER, "SETSLOT", Integer.toString(slot), "MIGRATING", targetNodeId);
@@ -567,7 +589,7 @@ public class RedisCluster
         int slot = getKeySlot(key);
         String sourceNodeId = getNodeId(sourceIndex);
         String targetNodeId = getNodeId(targetIndex);
-        int targetPort = getPort(targetIndex);
+        int targetPort = getInternalPort(targetIndex);
 
         // Mark slot as migrating/importing, move key, but do not set NODE owner
         try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {

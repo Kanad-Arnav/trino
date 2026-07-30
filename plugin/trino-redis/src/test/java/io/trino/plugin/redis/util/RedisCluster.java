@@ -142,7 +142,10 @@ public class RedisCluster
             if (tls) {
                 command.append(" --tls-port ").append(port)
                         .append(" --port 0")
+                        .append(" --tls-cluster yes")
                         .append(" --cluster-port ").append(port + 10000)
+                        .append(" --cluster-announce-port ").append(port)
+                        .append(" --cluster-announce-bus-port ").append(port + 10000)
                         .append(" --tls-cert-file ").append(CONTAINER_CERTS_DIR).append("redis.crt")
                         .append(" --tls-key-file ").append(CONTAINER_CERTS_DIR).append("redis.key")
                         .append(" --tls-ca-cert-file ").append(CONTAINER_CERTS_DIR).append("ca.crt");

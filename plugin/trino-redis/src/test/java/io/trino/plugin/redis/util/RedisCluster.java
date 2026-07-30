@@ -24,14 +24,17 @@ import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Protocol;
 import redis.clients.jedis.RedisClient;
 import redis.clients.jedis.RedisClusterClient;
+import redis.clients.jedis.SslOptions;
 import redis.clients.jedis.util.SafeEncoder;
 
 import java.io.Closeable;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Semaphore;
 
 import static com.google.common.base.Preconditions.checkState;
+import static org.testcontainers.utility.MountableFile.forClasspathResource;
 
 /**
  * Manages a real multi-primary Redis Cluster using a single Docker container
@@ -56,6 +59,7 @@ public class RedisCluster
     private static final int DEFAULT_NUM_REPLICAS = 0;
     private static final int DEFAULT_BASE_PORT = 7000;
     private static final int CLUSTER_TIMEOUT_MILLIS = 5000;
+    private static final String CONTAINER_CERTS_DIR = "/etc/redis/certs/";
 
     // RedisCluster uses fixed host port bindings, so only one cluster can be active at a time.
     private static final Semaphore CLUSTER_SEMAPHORE = new Semaphore(1);
@@ -66,19 +70,28 @@ public class RedisCluster
     private final List<HostAndPort> jedisSeedAddresses;
     private final List<com.google.common.net.HostAndPort> seedAddresses;
     private RedisClusterClient redisClusterClient;
+    private final boolean tls;
+    private final boolean auth;
 
     public RedisCluster()
     {
-        this(DEFAULT_NUM_PRIMARIES, DEFAULT_BASE_PORT, DEFAULT_NUM_REPLICAS);
+        this(DEFAULT_NUM_PRIMARIES, DEFAULT_BASE_PORT, DEFAULT_NUM_REPLICAS, false, false);
     }
 
     public RedisCluster(int numPrimaries, int basePort)
     {
-        this(numPrimaries, basePort, DEFAULT_NUM_REPLICAS);
+        this(numPrimaries, basePort, DEFAULT_NUM_REPLICAS, false, false);
     }
 
     public RedisCluster(int numPrimaries, int basePort, int numReplicas)
     {
+        this(numPrimaries, basePort, numReplicas, false, false);
+    }
+
+    public RedisCluster(int numPrimaries, int basePort, int numReplicas, boolean tls, boolean auth)
+    {
+        this.tls = tls;
+        this.auth = auth;
         clients = new ArrayList<>(numPrimaries);
         replicaClients = new ArrayList<>(numReplicas);
         jedisSeedAddresses = new ArrayList<>(numPrimaries);
@@ -125,13 +138,26 @@ public class RedisCluster
 
         for (int i = 0; i < allPorts.size(); i++) {
             int port = allPorts.get(i);
-            command.append("redis-server")
-                    .append(" --port ").append(port)
-                    .append(" --cluster-enabled yes")
+            command.append("redis-server");
+            if (tls) {
+                command.append(" --tls-port ").append(port)
+                        .append(" --port 0")
+                        .append(" --tls-cert-file ").append(CONTAINER_CERTS_DIR).append("redis.crt")
+                        .append(" --tls-key-file ").append(CONTAINER_CERTS_DIR).append("redis.key")
+                        .append(" --tls-ca-cert-file ").append(CONTAINER_CERTS_DIR).append("ca.crt");
+            }
+            else {
+                command.append(" --port ").append(port);
+            }
+            command.append(" --cluster-enabled yes")
                     .append(" --cluster-config-file nodes.conf")
                     .append(" --cluster-node-timeout ").append(CLUSTER_TIMEOUT_MILLIS)
                     .append(" --dir /data/").append(i)
                     .append(" --appendonly no");
+            if (auth) {
+                command.append(" --requirepass ").append(RedisServer.PASSWORD);
+                command.append(" --masterauth ").append(RedisServer.PASSWORD);
+            }
             command.append(" & ");
         }
         command.append("wait");
@@ -145,6 +171,11 @@ public class RedisCluster
         container = new GenericContainer<>("redis:" + RedisServer.LATEST_VERSION)
                 .withExposedPorts(allPorts.toArray(new Integer[0]))
                 .withCommand("/bin/sh", "-c", command.toString());
+        if (tls) {
+            container.withCopyFileToContainer(forClasspathResource("tls/ca.crt", 0644), CONTAINER_CERTS_DIR + "ca.crt")
+                    .withCopyFileToContainer(forClasspathResource("tls/redis.crt", 0644), CONTAINER_CERTS_DIR + "redis.crt")
+                    .withCopyFileToContainer(forClasspathResource("tls/redis.key", 0644), CONTAINER_CERTS_DIR + "redis.key");
+        }
         container.setPortBindings(portBindings.build());
         container.start();
 
@@ -154,7 +185,7 @@ public class RedisCluster
             int port = primaryPorts.get(i);
             RedisClient client = RedisClient.builder()
                     .hostAndPort(announceIp, port)
-                    .clientConfig(DefaultJedisClientConfig.builder().build())
+                    .clientConfig(buildClientConfig())
                     .build();
             try (Connection connection = client.getPool().getResource()) {
                 connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-ip", announceIp);
@@ -171,7 +202,7 @@ public class RedisCluster
             int port = replicaPorts.get(i);
             RedisClient client = RedisClient.builder()
                     .hostAndPort(announceIp, port)
-                    .clientConfig(DefaultJedisClientConfig.builder().build())
+                    .clientConfig(buildClientConfig())
                     .build();
             try (Connection connection = client.getPool().getResource()) {
                 connection.sendCommand(Protocol.Command.CONFIG, "SET", "cluster-announce-ip", announceIp);
@@ -186,7 +217,7 @@ public class RedisCluster
         formCluster(primaryPorts, replicaPorts);
 
         // Create RedisClusterClient for cluster-aware data loading
-        redisClusterClient = RedisClusterClient.create(ImmutableSet.copyOf(jedisSeedAddresses));
+        redisClusterClient = RedisClusterClient.create(ImmutableSet.copyOf(jedisSeedAddresses), buildClientConfig());
     }
 
     private void formCluster(List<Integer> primaryPorts, List<Integer> replicaPorts)
@@ -687,6 +718,26 @@ public class RedisCluster
         waitForClusterReady();
 
         return primaryIndex;
+    }
+
+    private DefaultJedisClientConfig buildClientConfig()
+    {
+        DefaultJedisClientConfig.Builder builder = DefaultJedisClientConfig.builder();
+        if (tls) {
+            builder.sslOptions(buildSslOptions());
+        }
+        if (auth) {
+            builder.password(RedisServer.PASSWORD);
+        }
+        return builder.build();
+    }
+
+    private static SslOptions buildSslOptions()
+    {
+        return SslOptions.builder()
+                .keystore(new File(RedisServer.getKeystorePath()), RedisServer.TLS_STORE_PASSWORD.toCharArray())
+                .truststore(new File(RedisServer.getTruststorePath()), RedisServer.TLS_STORE_PASSWORD.toCharArray())
+                .build();
     }
 
     @Override

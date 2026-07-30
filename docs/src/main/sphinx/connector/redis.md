@@ -127,6 +127,9 @@ The following constraints apply when `redis.cluster.enabled=true`:
   bounded number of attempts. If retries are exhausted, the query fails with a transient
   error so the user can retry, rather than returning incomplete results.
 
+Cluster mode can be combined with TLS (`redis.tls.enabled=true`) and password
+authentication (`redis.password`) for secure production deployments.
+
 This property is optional; the default is `false` (standalone mode).
 
 ### `redis.scan-count`

@@ -408,8 +408,16 @@ public class RedisCluster
 
         // MIGRATE KEYS atomically moves the key (handles DUMP/RESTORE/DEL/TTL server-side)
         try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.MIGRATE,
-                    "127.0.0.1", Integer.toString(targetPort), "", "0", "5000", "REPLACE", "KEYS", key);
+            connection.sendCommand(
+                    Protocol.Command.MIGRATE,
+                    "127.0.0.1",
+                    Integer.toString(targetPort),
+                    "",
+                    "0",
+                    "5000",
+                    "REPLACE",
+                    "KEYS",
+                    key);
             connection.getStatusCodeReply();
         }
 
@@ -535,8 +543,16 @@ public class RedisCluster
 
         // MIGRATE KEYS atomically moves the key (handles DUMP/RESTORE/DEL/TTL server-side)
         try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.MIGRATE,
-                    "127.0.0.1", Integer.toString(targetPort), "", "0", "5000", "REPLACE", "KEYS", key);
+            connection.sendCommand(
+                    Protocol.Command.MIGRATE,
+                    "127.0.0.1",
+                    Integer.toString(targetPort),
+                    "",
+                    "0",
+                    "5000",
+                    "REPLACE",
+                    "KEYS",
+                    key);
             connection.getStatusCodeReply();
         }
 
@@ -625,7 +641,8 @@ public class RedisCluster
     {
         checkState(!replicaClients.isEmpty(), "No replicas configured, cannot fail over");
         checkState(primaryIndex < clients.size() && primaryIndex < replicaClients.size(),
-                "Primary %s has no configured replica", primaryIndex);
+                "Primary %s has no configured replica",
+                primaryIndex);
 
         RedisClient primary = clients.get(primaryIndex);
         RedisClient replica = replicaClients.get(primaryIndex);

@@ -59,7 +59,7 @@ final class TestRedisClusterConcurrentResharding
 
         // Start a full scan in a background thread
         CompletableFuture<Long> queryFuture = CompletableFuture.supplyAsync(() ->
-                (Long) computeActual("SELECT count(*) FROM nation").getOnlyRow().get(0));
+                (Long) computeActual("SELECT count(*) FROM nation").getMaterializedRows().get(0).getField(0));
 
         // Give the query a moment to start, then migrate the slot
         Thread.sleep(100);
@@ -80,7 +80,7 @@ final class TestRedisClusterConcurrentResharding
 
         // Start a predicate query in a background thread
         CompletableFuture<String> queryFuture = CompletableFuture.supplyAsync(() ->
-                (String) computeActual("SELECT name FROM nation WHERE nationkey = 0").getOnlyRow().get(0));
+                (String) computeActual("SELECT name FROM nation WHERE nationkey = 0").getMaterializedRows().get(0).getField(0));
 
         // Give the query a moment to start, then migrate the slot
         Thread.sleep(100);

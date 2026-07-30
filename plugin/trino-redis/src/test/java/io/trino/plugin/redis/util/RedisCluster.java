@@ -217,7 +217,15 @@ public class RedisCluster
         formCluster(primaryPorts, replicaPorts);
 
         // Create RedisClusterClient for cluster-aware data loading
-        redisClusterClient = RedisClusterClient.create(ImmutableSet.copyOf(jedisSeedAddresses), buildClientConfig());
+        if (tls) {
+            redisClusterClient = new RedisClusterClient(ImmutableSet.copyOf(jedisSeedAddresses), buildClientConfig());
+        }
+        else if (auth) {
+            redisClusterClient = RedisClusterClient.create(ImmutableSet.copyOf(jedisSeedAddresses), null, RedisServer.PASSWORD);
+        }
+        else {
+            redisClusterClient = RedisClusterClient.create(ImmutableSet.copyOf(jedisSeedAddresses));
+        }
     }
 
     private void formCluster(List<Integer> primaryPorts, List<Integer> replicaPorts)

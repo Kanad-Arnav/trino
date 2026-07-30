@@ -18,7 +18,6 @@ import com.google.common.collect.ImmutableSet;
 import io.airlift.log.Logger;
 import io.trino.plugin.redis.RedisClusterTopology;
 import org.testcontainers.containers.GenericContainer;
-import redis.clients.jedis.CommandArguments;
 import redis.clients.jedis.Connection;
 import redis.clients.jedis.DefaultJedisClientConfig;
 import redis.clients.jedis.HostAndPort;
@@ -395,12 +394,7 @@ public class RedisCluster
         int slot = getKeySlot(key);
         String sourceNodeId = getNodeId(sourceIndex);
         String targetNodeId = getNodeId(targetIndex);
-
-        // DUMP and PTTL before SETSLOT — source owns the slot and serves normally
-        byte[] dumpedValue = dumpKey(clients.get(sourceIndex), key);
-        long ttl = pttlKey(clients.get(sourceIndex), key);
-        // PTTL returns -1 when the key has no expiration; RESTORE requires 0 for no TTL
-        long restoreTtl = ttl > 0 ? ttl : 0;
+        int targetPort = getPort(targetIndex);
 
         // Mark slot as migrating on source and importing on target
         try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
@@ -412,11 +406,12 @@ public class RedisCluster
             connection.getStatusCodeReply();
         }
 
-        // RESTORE on target with ASKING (slot is in IMPORTING state)
-        restoreKey(clients.get(targetIndex), key, dumpedValue, restoreTtl);
-
-        // DEL on source (source is in MIGRATING state; key still exists so DEL works)
-        delKey(clients.get(sourceIndex), key);
+        // MIGRATE KEYS atomically moves the key (handles DUMP/RESTORE/DEL/TTL server-side)
+        try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.MIGRATE,
+                    "127.0.0.1", Integer.toString(targetPort), "", "0", "5000", "REPLACE", "KEYS", key);
+            connection.getStatusCodeReply();
+        }
 
         // Finalize ownership on all primaries so clients get MOVED from source to target
         for (RedisClient client : clients) {
@@ -427,15 +422,6 @@ public class RedisCluster
         }
 
         waitForClusterReady();
-
-        // Verify the key exists on the target after slot finalization
-        try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.EXISTS, key);
-            Long exists = (Long) connection.getOne();
-            if (exists == null || exists == 0) {
-                throw new IllegalStateException("Key " + key + " not found on target after migration");
-            }
-        }
     }
 
     /**
@@ -454,51 +440,6 @@ public class RedisCluster
             }
         }
         waitForClusterReady();
-    }
-
-    private byte[] dumpKey(RedisClient client, String key)
-    {
-        try (Connection connection = client.getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.DUMP, key);
-            Object reply = connection.getOne();
-            checkState(reply != null, "DUMP returned null for key %s — key does not exist on source", key);
-            checkState(reply instanceof byte[], "DUMP returned unexpected type: %s", reply.getClass());
-            return (byte[]) reply;
-        }
-    }
-
-    private long pttlKey(RedisClient client, String key)
-    {
-        try (Connection connection = client.getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.PTTL, key);
-            Object reply = connection.getOne();
-            checkState(reply instanceof Long, "PTTL returned unexpected type: %s", reply.getClass());
-            return (Long) reply;
-        }
-    }
-
-    private void restoreKey(RedisClient client, String key, byte[] dumpedValue, long ttlMillis)
-    {
-        try (Connection connection = client.getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.ASKING);
-            connection.getStatusCodeReply();
-            // Use CommandArguments with raw byte[] — DUMP output is binary (RDB format)
-            // and must not be round-tripped through String (UTF-8) which corrupts non-UTF-8 bytes
-            connection.sendCommand(new CommandArguments(Protocol.Command.RESTORE)
-                    .add(key)
-                    .add(Long.toString(ttlMillis))
-                    .add(dumpedValue)
-                    .add("REPLACE"));
-            connection.getStatusCodeReply();
-        }
-    }
-
-    private void delKey(RedisClient client, String key)
-    {
-        try (Connection connection = client.getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.DEL, key);
-            connection.getIntegerReply();
-        }
     }
 
     public void migrateSlot(int slot, int targetIndex)
@@ -580,12 +521,7 @@ public class RedisCluster
         int slot = getKeySlot(key);
         String sourceNodeId = getNodeId(sourceIndex);
         String targetNodeId = getNodeId(targetIndex);
-
-        // DUMP and PTTL before SETSLOT — source owns the slot and serves normally
-        byte[] dumpedValue = dumpKey(clients.get(sourceIndex), key);
-        long ttl = pttlKey(clients.get(sourceIndex), key);
-        // PTTL returns -1 when the key has no expiration; RESTORE requires 0 for no TTL
-        long restoreTtl = ttl > 0 ? ttl : 0;
+        int targetPort = getPort(targetIndex);
 
         // Mark slot as migrating/importing, move key, but do not set NODE owner
         try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
@@ -597,21 +533,11 @@ public class RedisCluster
             connection.getStatusCodeReply();
         }
 
-        // RESTORE on target with ASKING (slot is in IMPORTING state)
-        restoreKey(clients.get(targetIndex), key, dumpedValue, restoreTtl);
-
-        // DEL on source (source is in MIGRATING state; key still exists so DEL works)
-        delKey(clients.get(sourceIndex), key);
-
-        // Verify the key exists on the target using ASKING (slot is in IMPORTING state)
-        try (Connection connection = clients.get(targetIndex).getPool().getResource()) {
-            connection.sendCommand(Protocol.Command.ASKING);
+        // MIGRATE KEYS atomically moves the key (handles DUMP/RESTORE/DEL/TTL server-side)
+        try (Connection connection = clients.get(sourceIndex).getPool().getResource()) {
+            connection.sendCommand(Protocol.Command.MIGRATE,
+                    "127.0.0.1", Integer.toString(targetPort), "", "0", "5000", "REPLACE", "KEYS", key);
             connection.getStatusCodeReply();
-            connection.sendCommand(Protocol.Command.EXISTS, key);
-            Long exists = (Long) connection.getOne();
-            if (exists == null || exists == 0) {
-                throw new IllegalStateException("Key " + key + " not found on target after migration (ASK state)");
-            }
         }
 
         // Slot remains in MIGRATING/IMPORTING state; source returns ASK target.
